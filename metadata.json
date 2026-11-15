@@ -1,0 +1,6 @@
+{
+  "name": "ControlQR — Registro de Asistencia",
+  "description": "Sistema de control de entradas y salidas mediante códigos QR con escáner continuo, generación de carnets y panel de administración.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
