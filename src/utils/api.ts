@@ -1,7 +1,11 @@
 import type {
+  AnalyticsResponse,
   AppSettings,
   AttendanceLog,
+  BulkImportResponse,
+  BulkImportRowInput,
   DailyAttendanceRow,
+  NotificationRules,
   Personnel,
   ScanResponse,
 } from '../types';
@@ -115,6 +119,14 @@ export async function logoutAdmin(): Promise<void> {
   setStoredAdminToken(null);
 }
 
+export async function fetchDatabaseStatus(): Promise<{
+  dbActive: boolean;
+  provider: 'sqlite' | 'supabase';
+  label: string;
+}> {
+  return apiFetch('/api/db/status');
+}
+
 export async function fetchScannerConfig(): Promise<{
   cooldownSeconds: number;
   organizationName: string;
@@ -152,6 +164,19 @@ export async function createPersonnel(input: {
     {
       method: 'POST',
       body: JSON.stringify(input),
+    },
+    true
+  );
+}
+
+export async function bulkCreatePersonnel(
+  rows: BulkImportRowInput[]
+): Promise<BulkImportResponse> {
+  return apiFetch<BulkImportResponse>(
+    '/api/personnel/bulk',
+    {
+      method: 'POST',
+      body: JSON.stringify({ rows }),
     },
     true
   );
@@ -203,6 +228,14 @@ export async function fetchAttendanceReport(
   );
 }
 
+export async function fetchAnalytics(date: string): Promise<AnalyticsResponse> {
+  return apiFetch<AnalyticsResponse>(
+    `/api/analytics?date=${encodeURIComponent(date)}`,
+    {},
+    true
+  );
+}
+
 export async function fetchSettings(): Promise<AppSettings> {
   return apiFetch<AppSettings>('/api/settings', {}, true);
 }
@@ -219,6 +252,11 @@ export async function updateSettings(payload: Partial<{
   smtp_pass: string;
   smtp_from: string;
   new_pin: string;
+  db_provider: 'sqlite' | 'supabase';
+  supabase_url: string;
+  supabase_key: string;
+  database_url: string;
+  notification_rules: NotificationRules;
 }>): Promise<AppSettings> {
   return apiFetch<AppSettings>(
     '/api/settings',
@@ -233,6 +271,21 @@ export async function updateSettings(payload: Partial<{
 export async function sendTestEmailRequest(payload: Record<string, unknown>): Promise<{ ok: boolean; message: string }> {
   return apiFetch<{ ok: boolean; message: string }>(
     '/api/settings/test-email',
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+    true
+  );
+}
+
+export async function testSupabaseConnection(payload: {
+  supabase_url: string;
+  supabase_key?: string;
+  database_url?: string;
+}): Promise<{ ok: boolean; message: string }> {
+  return apiFetch<{ ok: boolean; message: string }>(
+    '/api/settings/test-supabase',
     {
       method: 'POST',
       body: JSON.stringify(payload),

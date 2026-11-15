@@ -8,6 +8,8 @@ import {
   UserPlus,
 } from 'lucide-react';
 import type { ModuleView } from '../types';
+import { DatabaseStatusDot } from './DatabaseStatusDot';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface HomeAccessViewProps {
   organizationName: string;
@@ -49,7 +51,7 @@ export function HomeAccessView({
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-8 px-6 py-4">
           <span className="font-display text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
-            {organizationName}
+            Control de Ingreso
           </span>
 
           <div className="hidden items-center gap-3 text-sm text-slate-500 sm:flex">
@@ -60,7 +62,9 @@ export function HomeAccessView({
             </span>
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-3.5 shrink-0">
+            <DatabaseStatusDot />
+            <PWAInstallButton />
             {isAdminAuthenticated ? (
               <button
                 type="button"

@@ -1,5 +1,7 @@
 import { ArrowLeft, Lock, LockOpen } from 'lucide-react';
 import type { ModuleView } from '../types';
+import { DatabaseStatusDot } from './DatabaseStatusDot';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface ModuleHeaderProps {
   organizationName: string;
@@ -31,6 +33,10 @@ export function ModuleHeader({
           </button>
           <span className="font-display text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
             {organizationName}
+          </span>
+          <span className="hidden text-slate-300 sm:inline" aria-hidden="true">·</span>
+          <span className="hidden sm:inline-flex">
+            <DatabaseStatusDot compact />
           </span>
         </div>
 
@@ -73,8 +79,9 @@ export function ModuleHeader({
           </button>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: Install & primary session action */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          <PWAInstallButton />
           {isAdminAuthenticated ? (
             <button
               type="button"

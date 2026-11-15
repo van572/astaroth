@@ -2,45 +2,27 @@ import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { Pool } from 'pg';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const rawDataDir = process.env.DATA_DIR?.trim() || '';
+const dataDirIsPostgresUrl = /^postgres(ql)?:\/\//i.test(rawDataDir);
+const DATA_DIR = rawDataDir && !dataDirIsPostgresUrl
+  ? path.resolve(rawDataDir)
+  : path.resolve(process.cwd(), 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
 const DB_PATH = path.join(DATA_DIR, 'controlqr.db');
 const MASTER_KEY_PATH = path.join(DATA_DIR, '.master.key');
 
-const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
-export const isPostgres = Boolean(DATABASE_URL);
-
-let sqliteDb: Database.Database | null = null;
-let pgPool: Pool | null = null;
-
-if (isPostgres) {
-  const isLocalPg =
-    DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
-  pgPool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: isLocalPg ? false : { rejectUnauthorized: false },
-    max: 10,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
-  });
-} else {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  sqliteDb = new Database(DB_PATH);
-  sqliteDb.pragma('journal_mode = WAL');
-  sqliteDb.pragma('foreign_keys = ON');
-}
+export const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
 function getEncryptionKey(): Buffer {
   const envKey = process.env.SMTP_ENCRYPTION_KEY?.trim();
   if (envKey) {
     return crypto.createHash('sha256').update(envKey).digest();
-  }
-
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
   }
 
   if (fs.existsSync(MASTER_KEY_PATH)) {
@@ -88,126 +70,64 @@ export function hashPin(pin: string): string {
   return crypto.createHash('sha256').update(`controlqr-pin-salt:${pin}`).digest('hex');
 }
 
+export async function execute(sql: string, params: unknown[] = []): Promise<unknown> {
+  const normalizedSql = sql.replace(/\$\d+/g, '?');
+  return db.prepare(normalizedSql).run(...params);
+}
+
 const DEFAULT_PIN = process.env.INITIAL_ADMIN_PIN?.trim() || '1234';
 export const DEFAULT_PIN_HASH = hashPin(DEFAULT_PIN);
 
-function toSqliteSql(sql: string): string {
-  return sql.replace(/\$(\d+)/g, '?');
-}
+export function initDatabase(): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
 
-export async function queryOne<T>(sql: string, params: unknown[] = []): Promise<T | undefined> {
-  if (pgPool) {
-    const res = await pgPool.query(sql, params);
-    return res.rows[0] as T | undefined;
+    CREATE TABLE IF NOT EXISTS personnel (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      qr_token TEXT UNIQUE NOT NULL,
+      full_name TEXT NOT NULL,
+      document_id TEXT UNIQUE NOT NULL,
+      role_department TEXT NOT NULL,
+      photo_data TEXT,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS attendance_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      personnel_id INTEGER NOT NULL,
+      movement_type TEXT NOT NULL CHECK(movement_type IN ('Entrada', 'Salida')),
+      scanned_at TEXT NOT NULL,
+      local_date TEXT NOT NULL,
+      local_time TEXT NOT NULL,
+      email_status TEXT NOT NULL DEFAULT 'skipped',
+      email_error TEXT,
+      client_scan_id TEXT,
+      FOREIGN KEY (personnel_id) REFERENCES personnel(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_logs(local_date);
+    CREATE INDEX IF NOT EXISTS idx_attendance_personnel_date ON attendance_logs(personnel_id, local_date);
+    CREATE INDEX IF NOT EXISTS idx_personnel_qr ON personnel(qr_token);
+  `);
+
+  const logColumns = db.prepare('PRAGMA table_info(attendance_logs)').all() as Array<{ name: string }>;
+  if (!logColumns.some((col) => col.name === 'client_scan_id')) {
+    db.exec('ALTER TABLE attendance_logs ADD COLUMN client_scan_id TEXT;');
   }
-  if (!sqliteDb) throw new Error('SQLite no inicializado');
-  return sqliteDb.prepare(toSqliteSql(sql)).get(...params) as T | undefined;
-}
-
-export async function queryAll<T>(sql: string, params: unknown[] = []): Promise<T[]> {
-  if (pgPool) {
-    const res = await pgPool.query(sql, params);
-    return res.rows as T[];
-  }
-  if (!sqliteDb) throw new Error('SQLite no inicializado');
-  return sqliteDb.prepare(toSqliteSql(sql)).all(...params) as T[];
-}
-
-export async function execute(
-  sql: string,
-  params: unknown[] = []
-): Promise<{ lastInsertId: number; changes: number }> {
-  if (pgPool) {
-    const res = await pgPool.query(sql, params);
-    const firstRow = res.rows[0] as { id?: number | string } | undefined;
-    return {
-      lastInsertId: firstRow?.id !== undefined ? Number(firstRow.id) : 0,
-      changes: res.rowCount ?? 0,
-    };
-  }
-  if (!sqliteDb) throw new Error('SQLite no inicializado');
-  const cleanSql = toSqliteSql(sql).replace(/\s+RETURNING\s+id\s*$/i, '');
-  const info = sqliteDb.prepare(cleanSql).run(...params);
-  return {
-    lastInsertId: Number(info.lastInsertRowid || 0),
-    changes: info.changes,
-  };
-}
-
-export async function initDatabase(): Promise<void> {
-  if (pgPool) {
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS personnel (
-        id SERIAL PRIMARY KEY,
-        qr_token TEXT UNIQUE NOT NULL,
-        full_name TEXT NOT NULL,
-        document_id TEXT UNIQUE NOT NULL,
-        role_department TEXT NOT NULL,
-        photo_data TEXT,
-        is_active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS attendance_logs (
-        id SERIAL PRIMARY KEY,
-        personnel_id INTEGER NOT NULL REFERENCES personnel(id),
-        movement_type TEXT NOT NULL CHECK(movement_type IN ('Entrada', 'Salida')),
-        scanned_at TEXT NOT NULL,
-        local_date TEXT NOT NULL,
-        local_time TEXT NOT NULL,
-        email_status TEXT NOT NULL DEFAULT 'skipped',
-        email_error TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_logs(local_date);
-      CREATE INDEX IF NOT EXISTS idx_attendance_personnel_date ON attendance_logs(personnel_id, local_date);
-      CREATE INDEX IF NOT EXISTS idx_personnel_qr ON personnel(qr_token);
-    `);
-  } else if (sqliteDb) {
-    sqliteDb.exec(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS personnel (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        qr_token TEXT UNIQUE NOT NULL,
-        full_name TEXT NOT NULL,
-        document_id TEXT UNIQUE NOT NULL,
-        role_department TEXT NOT NULL,
-        photo_data TEXT,
-        is_active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS attendance_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        personnel_id INTEGER NOT NULL,
-        movement_type TEXT NOT NULL CHECK(movement_type IN ('Entrada', 'Salida')),
-        scanned_at TEXT NOT NULL,
-        local_date TEXT NOT NULL,
-        local_time TEXT NOT NULL,
-        email_status TEXT NOT NULL DEFAULT 'skipped',
-        email_error TEXT,
-        FOREIGN KEY (personnel_id) REFERENCES personnel(id)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_logs(local_date);
-      CREATE INDEX IF NOT EXISTS idx_attendance_personnel_date ON attendance_logs(personnel_id, local_date);
-      CREATE INDEX IF NOT EXISTS idx_personnel_qr ON personnel(qr_token);
-    `);
-  }
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_client_scan_id ON attendance_logs(client_scan_id) WHERE client_scan_id IS NOT NULL;'
+  );
 
   const envPass = process.env.SMTP_PASS || '';
   const hasEnvSmtp = Boolean(process.env.SMTP_HOST?.trim() && process.env.ADMIN_EMAIL?.trim());
+  const envSupabaseKey = process.env.SUPABASE_KEY?.trim() || '';
+  const envDatabaseUrl = process.env.DATABASE_URL?.trim() || (dataDirIsPostgresUrl ? rawDataDir : '');
+  const hasEnvSupabase = Boolean(process.env.SUPABASE_URL?.trim() || envDatabaseUrl);
 
   const defaultSettings: Record<string, string> = {
     admin_pin_hash: DEFAULT_PIN_HASH,
@@ -221,30 +141,55 @@ export async function initDatabase(): Promise<void> {
     smtp_user: process.env.SMTP_USER?.trim() || '',
     smtp_pass: envPass ? encryptSecret(envPass) : '',
     smtp_from: process.env.SMTP_FROM?.trim() || '',
+    db_provider: hasEnvSupabase ? 'supabase' : 'sqlite',
+    supabase_url: process.env.SUPABASE_URL?.trim() || '',
+    supabase_key: envSupabaseKey ? encryptSecret(envSupabaseKey) : '',
+    database_url: envDatabaseUrl ? encryptSecret(envDatabaseUrl) : '',
+    notification_rules: JSON.stringify({
+      departmentScope: 'all',
+      allowedDepartments: [],
+      eventMode: 'all',
+      notifyOnEntry: true,
+      notifyOnExit: true,
+      notifyOnLateEntry: true,
+      notifyOnEarlyExit: true,
+      workStartTime: '09:00',
+      lateGraceMinutes: 10,
+      workEndTime: '17:00',
+      earlyGraceMinutes: 10,
+    }),
   };
 
-  for (const [key, value] of Object.entries(defaultSettings)) {
-    await execute(
-      'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
-      [key, value]
-    );
-  }
+  const insertSetting = db.prepare(
+    'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)'
+  );
+
+  const tx = db.transaction(() => {
+    for (const [key, value] of Object.entries(defaultSettings)) {
+      insertSetting.run(key, value);
+    }
+  });
+  tx();
 }
 
-export async function getSetting(key: string): Promise<string> {
-  const row = await queryOne<{ value: string }>('SELECT value FROM settings WHERE key = $1', [key]);
+export function getSetting(key: string): string {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
   return row ? row.value : '';
 }
 
-export async function setSetting(key: string, value: string): Promise<void> {
-  await execute(
-    'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    [key, value]
-  );
+export function setSetting(key: string, value: string): void {
+  db.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).run(key, value);
 }
 
-export async function getAllSettingsMap(): Promise<Record<string, string>> {
-  const rows = await queryAll<{ key: string; value: string }>('SELECT key, value FROM settings');
+export function getAllSettingsMap(): Record<string, string> {
+  const rows = db.prepare('SELECT key, value FROM settings').all() as Array<{
+    key: string;
+    value: string;
+  }>;
   const map: Record<string, string> = {};
   for (const row of rows) {
     map[row.key] = row.value;
@@ -252,9 +197,11 @@ export async function getAllSettingsMap(): Promise<Record<string, string>> {
   return map;
 }
 
-export async function getResolvedSettingsMap(): Promise<Record<string, string>> {
-  const map = await getAllSettingsMap();
+export function getResolvedSettingsMap(): Record<string, string> {
+  const map = getAllSettingsMap();
   const decryptedDbPass = decryptSecret(map.smtp_pass || '');
+  const decryptedSupabaseKey = decryptSecret(map.supabase_key || '');
+  const decryptedDatabaseUrl = decryptSecret(map.database_url || '');
   return {
     ...map,
     admin_email: map.admin_email || process.env.ADMIN_EMAIL?.trim() || '',
@@ -264,5 +211,9 @@ export async function getResolvedSettingsMap(): Promise<Record<string, string>> 
     smtp_user: map.smtp_user || process.env.SMTP_USER?.trim() || '',
     smtp_pass: decryptedDbPass || process.env.SMTP_PASS || '',
     smtp_from: map.smtp_from || process.env.SMTP_FROM?.trim() || '',
+    db_provider: map.db_provider === 'supabase' ? 'supabase' : 'sqlite',
+    supabase_url: map.supabase_url || process.env.SUPABASE_URL?.trim() || '',
+    supabase_key: decryptedSupabaseKey || process.env.SUPABASE_KEY?.trim() || '',
+    database_url: decryptedDatabaseUrl || process.env.DATABASE_URL?.trim() || (dataDirIsPostgresUrl ? rawDataDir : ''),
   };
 }

@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
   Ban,
+  BarChart3,
+  BellRing,
   CheckCircle2,
+  Database,
   Download,
   Edit3,
+  Eye,
+  EyeOff,
   FileSpreadsheet,
+  KeyRound,
   Mail,
+  Plus,
   QrCode,
   RefreshCw,
   Save,
@@ -18,24 +25,31 @@ import {
   X,
 } from 'lucide-react';
 import type {
+  AnalyticsResponse,
   AppSettings,
   AttendanceLog,
   DailyAttendanceRow,
+  NotificationRules,
   Personnel,
 } from '../types';
 import {
+  fetchAnalytics,
   fetchAttendanceLogs,
   fetchAttendanceReport,
   fetchPersonnel,
   fetchSettings,
   getLocalDateString,
   sendTestEmailRequest,
+  testSupabaseConnection,
   togglePersonnelStatus,
   updatePersonnel,
   updateSettings,
 } from '../utils/api';
 import { getInitials, resizePhotoFile } from '../utils/cardExporter';
 import { exportAttendanceCsv, exportAttendanceXlsx } from '../utils/reportExporter';
+import { refreshDatabaseStatus } from '../hooks/useDatabaseStatus';
+import { AttendanceChartsSection } from './AttendanceChartsSection';
+import { DatabaseStatusDot } from './DatabaseStatusDot';
 import { IdCardPreview } from './IdCardPreview';
 
 interface AdminModuleProps {
@@ -44,21 +58,36 @@ interface AdminModuleProps {
   onAuthExpired: () => void;
 }
 
-type AdminTab = 'personnel' | 'reports' | 'settings';
+type AdminTab = 'overview' | 'personnel' | 'reports' | 'settings';
 type PersonnelFilter = 'all' | 'active' | 'inactive';
 type ReportViewMode = 'consolidated' | 'realtime';
+
+const DEFAULT_RULES: NotificationRules = {
+  departmentScope: 'all',
+  allowedDepartments: [],
+  eventMode: 'all',
+  notifyOnEntry: true,
+  notifyOnExit: true,
+  notifyOnLateEntry: true,
+  notifyOnEarlyExit: true,
+  workStartTime: '09:00',
+  lateGraceMinutes: 10,
+  workEndTime: '17:00',
+  earlyGraceMinutes: 10,
+};
 
 export function AdminModule({
   organizationName,
   onOrganizationNameChange,
   onAuthExpired,
 }: AdminModuleProps) {
-  const [activeTab, setActiveTab] = useState<AdminTab>('personnel');
+  const [activeTab, setActiveTab] = useState<AdminTab>('overview');
 
   // Data state
   const [personnel, setPersonnel] = useState<Personnel[]>([]);
   const [logs, setLogs] = useState<AttendanceLog[]>([]);
   const [reportRows, setReportRows] = useState<DailyAttendanceRow[]>([]);
+  const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
 
   const [loading, setLoading] = useState(true);
@@ -98,6 +127,14 @@ export function AdminModule({
   const [smtpPassInput, setSmtpPassInput] = useState('');
   const [smtpFromInput, setSmtpFromInput] = useState('');
   const [newPinInput, setNewPinInput] = useState('');
+  const [secretDbUnlocked, setSecretDbUnlocked] = useState(false);
+  const [dbProviderInput, setDbProviderInput] = useState<'sqlite' | 'supabase'>('sqlite');
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState('');
+  const [supabaseKeyInput, setSupabaseKeyInput] = useState('');
+  const [databaseUrlInput, setDatabaseUrlInput] = useState('');
+  const [testingSupabase, setTestingSupabase] = useState(false);
+  const [rulesInput, setRulesInput] = useState<NotificationRules>(DEFAULT_RULES);
+  const [customDeptInput, setCustomDeptInput] = useState('');
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsStatus, setSettingsStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(
     null
@@ -120,15 +157,17 @@ export function AdminModule({
     async (dateForReport: string, absentFlag: boolean, silent = false) => {
       if (!silent) setLoading(true);
       try {
-        const [pList, lList, rList, sData] = await Promise.all([
+        const [pList, lList, rList, aData, sData] = await Promise.all([
           fetchPersonnel(),
           fetchAttendanceLogs(dateForReport),
           fetchAttendanceReport(dateForReport, absentFlag),
+          fetchAnalytics(dateForReport),
           fetchSettings(),
         ]);
         setPersonnel(pList);
         setLogs(lList);
         setReportRows(rList);
+        setAnalytics(aData);
         setSettings(sData);
 
         if (!silent) {
@@ -141,6 +180,9 @@ export function AdminModule({
           setSmtpSecureInput(sData.smtp_secure);
           setSmtpUserInput(sData.smtp_user);
           setSmtpFromInput(sData.smtp_from);
+          setDbProviderInput(sData.db_provider || 'sqlite');
+          setSupabaseUrlInput(sData.supabase_url || '');
+          setRulesInput(sData.notification_rules || DEFAULT_RULES);
         }
         setErrorBanner('');
       } catch (err) {
@@ -200,6 +242,23 @@ export function AdminModule({
         l.role_department.toLowerCase().includes(q)
     );
   }, [logs, reportSearch]);
+
+  const availableDepartments = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of personnel) {
+      const clean = p.role_department.trim();
+      if (clean && !map.has(clean.toLowerCase())) {
+        map.set(clean.toLowerCase(), clean);
+      }
+    }
+    for (const d of rulesInput.allowedDepartments) {
+      const clean = d.trim();
+      if (clean && !map.has(clean.toLowerCase())) {
+        map.set(clean.toLowerCase(), clean);
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => a.localeCompare(b, 'es'));
+  }, [personnel, rulesInput.allowedDepartments]);
 
   const metrics = useMemo(() => {
     const activeCount = personnel.filter((p) => p.is_active === 1).length;
@@ -282,15 +341,24 @@ export function AdminModule({
         smtp_pass: smtpPassInput,
         smtp_from: smtpFromInput.trim(),
         new_pin: newPinInput.trim() || undefined,
+        db_provider: dbProviderInput,
+        supabase_url: supabaseUrlInput.trim(),
+        supabase_key: supabaseKeyInput.trim() || undefined,
+        database_url: databaseUrlInput.trim() || undefined,
+        notification_rules: rulesInput,
       });
       setSettings(updated);
+      setRulesInput(updated.notification_rules || DEFAULT_RULES);
       setSmtpPassInput('');
+      setSupabaseKeyInput('');
+      setDatabaseUrlInput('');
       setNewPinInput('');
       onOrganizationNameChange(updated.organization_name);
       setSettingsStatus({
         type: 'ok',
         text: 'Configuración guardada correctamente.',
       });
+      void refreshDatabaseStatus();
     } catch (err) {
       setSettingsStatus({
         type: 'err',
@@ -298,6 +366,27 @@ export function AdminModule({
       });
     } finally {
       setSettingsSaving(false);
+    }
+  }
+
+  async function handleTestSupabase() {
+    setTestingSupabase(true);
+    setSettingsStatus(null);
+    try {
+      const res = await testSupabaseConnection({
+        supabase_url: supabaseUrlInput.trim(),
+        supabase_key: supabaseKeyInput.trim() || undefined,
+        database_url: databaseUrlInput.trim() || undefined,
+      });
+      setSettingsStatus({ type: 'ok', text: res.message });
+      void refreshDatabaseStatus();
+    } catch (err) {
+      setSettingsStatus({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo verificar la conexión con Supabase.',
+      });
+    } finally {
+      setTestingSupabase(false);
     }
   }
 
@@ -339,7 +428,19 @@ export function AdminModule({
           </p>
         </div>
 
-        <div className="flex items-center gap-1 rounded-lg bg-slate-200/70 p-1">
+        <div className="flex flex-wrap items-center gap-1 rounded-lg bg-slate-200/70 p-1">
+          <button
+            type="button"
+            onClick={() => setActiveTab('overview')}
+            className={`inline-flex items-center gap-2 rounded-md px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'overview'
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            Resumen Visual
+          </button>
           <button
             type="button"
             onClick={() => setActiveTab('personnel')}
@@ -383,6 +484,17 @@ export function AdminModule({
         <div className="mt-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
           {errorBanner}
         </div>
+      )}
+
+      {/* TAB 0: VISUAL ANALYTICS OVERVIEW */}
+      {activeTab === 'overview' && (
+        <AttendanceChartsSection
+          analytics={analytics}
+          loading={loading}
+          selectedDate={selectedDate}
+          onDateChange={(d) => setSelectedDate(d)}
+          onRefresh={() => loadAllData(selectedDate, includeAbsent, false)}
+        />
       )}
 
       {/* TAB 1: PERSONNEL MANAGEMENT */}
@@ -811,7 +923,9 @@ export function AdminModule({
                             <span className="text-amber-700 font-medium">Enviando...</span>
                           )}
                           {log.email_status === 'skipped' && (
-                            <span className="text-slate-400">Desactivado / Sin SMTP</span>
+                            <span className="text-slate-500" title={log.email_error || ''}>
+                              {log.email_error || 'Desactivado / Sin SMTP'}
+                            </span>
                           )}
                           {log.email_status === 'failed' && (
                             <span className="text-red-700 font-medium" title={log.email_error || ''}>
@@ -1061,6 +1175,643 @@ export function AdminModule({
                 {settingsSaving ? 'Guardando cambios...' : 'Guardar Configuración'}
               </button>
             </div>
+          </div>
+
+          {/* Custom Notification Rules Section */}
+          <div className="rounded-xl border border-slate-200 bg-white p-6 lg:col-span-12">
+            <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-100 pb-4">
+              <div className="flex items-start gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-700">
+                  <BellRing className="h-5 w-5" />
+                </div>
+                <div>
+                  <h2 className="font-display text-lg font-bold text-slate-900">
+                    Reglas de Notificación Personalizadas
+                  </h2>
+                  <p className="mt-0.5 text-xs text-slate-600">
+                    Filtre los correos automáticos para recibir alertas únicamente de ciertos departamentos o incidencias específicas (retardos y salidas tempranas).
+                  </p>
+                </div>
+              </div>
+
+              <span className="text-xs font-medium text-slate-500">
+                {alertsEnabledInput
+                  ? 'Filtro aplicado sobre alertas activas'
+                  : 'Active "Activar alertas" en SMTP para enviar correos'}
+              </span>
+            </div>
+
+            <div className="mt-5 grid grid-cols-1 gap-6 lg:grid-cols-12">
+              {/* Column 1: Department Filter */}
+              <div className="space-y-3.5 lg:col-span-5">
+                <div>
+                  <label className="block text-sm font-semibold text-slate-900">
+                    1. Alcance por departamento
+                  </label>
+                  <p className="text-xs text-slate-500">
+                    Elija si las alertas aplican a toda la organización o solo a áreas puntuales.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-1.5 rounded-lg bg-slate-100 p-1">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRulesInput((prev) => ({ ...prev, departmentScope: 'all' }))
+                    }
+                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                      rulesInput.departmentScope === 'all'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Todos los departamentos
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRulesInput((prev) => ({ ...prev, departmentScope: 'selected' }))
+                    }
+                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                      rulesInput.departmentScope === 'selected'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Solo seleccionados ({rulesInput.allowedDepartments.length})
+                  </button>
+                </div>
+
+                {rulesInput.departmentScope === 'selected' && (
+                  <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50/70 p-3.5">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="font-medium text-slate-700">
+                        Departamentos habilitados
+                      </span>
+                      {availableDepartments.length > 0 && (
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setRulesInput((prev) => ({
+                                ...prev,
+                                allowedDepartments: [...availableDepartments],
+                              }))
+                            }
+                            className="font-semibold text-blue-700 hover:underline"
+                          >
+                            Marcar todos
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setRulesInput((prev) => ({
+                                ...prev,
+                                allowedDepartments: [],
+                              }))
+                            }
+                            className="font-medium text-slate-500 hover:text-slate-800"
+                          >
+                            Limpiar
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {availableDepartments.length === 0 ? (
+                      <p className="text-xs text-slate-500">
+                        Aún no hay departamentos registrados en el personal. Agregue uno abajo para preconfigurar la regla.
+                      </p>
+                    ) : (
+                      <div className="grid max-h-44 grid-cols-1 gap-1.5 overflow-y-auto sm:grid-cols-2">
+                        {availableDepartments.map((dept) => {
+                          const checked = rulesInput.allowedDepartments.some(
+                            (d) => d.trim().toLowerCase() === dept.toLowerCase()
+                          );
+                          return (
+                            <label
+                              key={dept}
+                              className={`flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors ${
+                                checked
+                                  ? 'border-blue-600 bg-blue-50 font-medium text-blue-900'
+                                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  const isChecked = e.target.checked;
+                                  setRulesInput((prev) => {
+                                    const filtered = prev.allowedDepartments.filter(
+                                      (d) => d.trim().toLowerCase() !== dept.toLowerCase()
+                                    );
+                                    return {
+                                      ...prev,
+                                      allowedDepartments: isChecked
+                                        ? [...filtered, dept]
+                                        : filtered,
+                                    };
+                                  });
+                                }}
+                                className="h-3.5 w-3.5 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                              />
+                              <span className="truncate">{dept}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div className="flex items-center gap-2 pt-1">
+                      <input
+                        type="text"
+                        value={customDeptInput}
+                        onChange={(e) => setCustomDeptInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            const val = customDeptInput.trim();
+                            if (!val) return;
+                            setRulesInput((prev) => {
+                              const exists = prev.allowedDepartments.some(
+                                (d) => d.trim().toLowerCase() === val.toLowerCase()
+                              );
+                              return exists
+                                ? prev
+                                : {
+                                    ...prev,
+                                    allowedDepartments: [...prev.allowedDepartments, val],
+                                  };
+                            });
+                            setCustomDeptInput('');
+                          }
+                        }}
+                        placeholder="Agregar cargo/depto. manual..."
+                        className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-blue-700 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = customDeptInput.trim();
+                          if (!val) return;
+                          setRulesInput((prev) => {
+                            const exists = prev.allowedDepartments.some(
+                              (d) => d.trim().toLowerCase() === val.toLowerCase()
+                            );
+                            return exists
+                              ? prev
+                              : {
+                                  ...prev,
+                                  allowedDepartments: [...prev.allowedDepartments, val],
+                                };
+                          });
+                          setCustomDeptInput('');
+                        }}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 whitespace-nowrap shrink-0"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        Añadir
+                      </button>
+                    </div>
+
+                    {rulesInput.allowedDepartments.length === 0 && (
+                      <p className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-800">
+                        Sin departamentos marcados: no se enviarán alertas por correo hasta seleccionar al menos uno.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Column 2: Incident & Event Type Filter + Schedule */}
+              <div className="space-y-4 lg:col-span-7">
+                <div>
+                  <label className="block text-sm font-semibold text-slate-900">
+                    2. Movimientos e incidencias a notificar
+                  </label>
+                  <p className="text-xs text-slate-500">
+                    Defina si desea recibir todos los registros o restringir las alertas a incidencias como retardos y salidas tempranas.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 gap-1.5 rounded-lg bg-slate-100 p-1 sm:grid-cols-3">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRulesInput((prev) => ({ ...prev, eventMode: 'all' }))
+                    }
+                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                      rulesInput.eventMode === 'all'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Todos los movimientos
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRulesInput((prev) => ({ ...prev, eventMode: 'incidents_only' }))
+                    }
+                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                      rulesInput.eventMode === 'incidents_only'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Solo incidencias
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRulesInput((prev) => ({ ...prev, eventMode: 'custom' }))
+                    }
+                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                      rulesInput.eventMode === 'custom'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Personalizado
+                  </button>
+                </div>
+
+                {rulesInput.eventMode !== 'all' && (
+                  <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    {rulesInput.eventMode === 'custom' && (
+                      <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 bg-slate-50/70 p-3 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={rulesInput.notifyOnEntry}
+                          onChange={(e) =>
+                            setRulesInput((prev) => ({
+                              ...prev,
+                              notifyOnEntry: e.target.checked,
+                            }))
+                          }
+                          className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                        />
+                        <div>
+                          <span className="block font-semibold text-slate-900">
+                            Entradas puntuales
+                          </span>
+                          <span className="text-slate-500">
+                            Ingresos dentro de la hora límite y tolerancia.
+                          </span>
+                        </div>
+                      </label>
+                    )}
+
+                    <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/50 p-3 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={rulesInput.notifyOnLateEntry}
+                        onChange={(e) =>
+                          setRulesInput((prev) => ({
+                            ...prev,
+                            notifyOnLateEntry: e.target.checked,
+                          }))
+                        }
+                        className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                      />
+                      <div>
+                        <span className="block font-semibold text-slate-900">
+                          Retardos en entrada
+                        </span>
+                        <span className="text-slate-600">
+                          Entradas posteriores a {rulesInput.workStartTime} + {rulesInput.lateGraceMinutes} min.
+                        </span>
+                      </div>
+                    </label>
+
+                    {rulesInput.eventMode === 'custom' && (
+                      <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 bg-slate-50/70 p-3 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={rulesInput.notifyOnExit}
+                          onChange={(e) =>
+                            setRulesInput((prev) => ({
+                              ...prev,
+                              notifyOnExit: e.target.checked,
+                            }))
+                          }
+                          className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                        />
+                        <div>
+                          <span className="block font-semibold text-slate-900">
+                            Salidas regulares
+                          </span>
+                          <span className="text-slate-500">
+                            Salidas en horario normal o posterior a la jornada.
+                          </span>
+                        </div>
+                      </label>
+                    )}
+
+                    <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/50 p-3 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={rulesInput.notifyOnEarlyExit}
+                        onChange={(e) =>
+                          setRulesInput((prev) => ({
+                            ...prev,
+                            notifyOnEarlyExit: e.target.checked,
+                          }))
+                        }
+                        className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                      />
+                      <div>
+                        <span className="block font-semibold text-slate-900">
+                          Salidas tempranas
+                        </span>
+                        <span className="text-slate-600">
+                          Salidas previas a {rulesInput.workEndTime} (margen {rulesInput.earlyGraceMinutes} min).
+                        </span>
+                      </div>
+                    </label>
+                  </div>
+                )}
+
+                {/* Schedule Reference Thresholds */}
+                <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-800">
+                      Umbrales de horario para detección de incidencias
+                    </span>
+                    <span className="text-xs text-slate-500">
+                      Se incluye el detalle de la incidencia en el asunto del correo
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    <div>
+                      <label htmlFor="rule-start-time" className="block text-xs font-medium text-slate-600">
+                        Hora límite entrada
+                      </label>
+                      <input
+                        id="rule-start-time"
+                        type="time"
+                        value={rulesInput.workStartTime}
+                        onChange={(e) =>
+                          setRulesInput((prev) => ({
+                            ...prev,
+                            workStartTime: e.target.value || '09:00',
+                          }))
+                        }
+                        className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-blue-700 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label htmlFor="rule-late-grace" className="block text-xs font-medium text-slate-600">
+                        Tolerancia (min)
+                      </label>
+                      <input
+                        id="rule-late-grace"
+                        type="number"
+                        min={0}
+                        max={180}
+                        value={rulesInput.lateGraceMinutes}
+                        onChange={(e) =>
+                          setRulesInput((prev) => ({
+                            ...prev,
+                            lateGraceMinutes: Math.max(0, Math.min(180, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 tabular-nums focus:border-blue-700 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label htmlFor="rule-end-time" className="block text-xs font-medium text-slate-600">
+                        Hora mínima salida
+                      </label>
+                      <input
+                        id="rule-end-time"
+                        type="time"
+                        value={rulesInput.workEndTime}
+                        onChange={(e) =>
+                          setRulesInput((prev) => ({
+                            ...prev,
+                            workEndTime: e.target.value || '17:00',
+                          }))
+                        }
+                        className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-blue-700 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label htmlFor="rule-early-grace" className="block text-xs font-medium text-slate-600">
+                        Margen previo (min)
+                      </label>
+                      <input
+                        id="rule-early-grace"
+                        type="number"
+                        min={0}
+                        max={180}
+                        value={rulesInput.earlyGraceMinutes}
+                        onChange={(e) =>
+                          setRulesInput((prev) => ({
+                            ...prev,
+                            earlyGraceMinutes: Math.max(0, Math.min(180, Number(e.target.value) || 0)),
+                          }))
+                        }
+                        className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 tabular-nums focus:border-blue-700 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-wrap items-center justify-between gap-4 border-t border-slate-100 pt-4">
+              <p className="text-xs text-slate-600">
+                <strong className="text-slate-900">Resumen activo:</strong>{' '}
+                {rulesInput.departmentScope === 'all'
+                  ? 'Todos los departamentos'
+                  : rulesInput.allowedDepartments.length > 0
+                  ? `${rulesInput.allowedDepartments.length} depto(s): ${rulesInput.allowedDepartments.join(', ')}`
+                  : 'Ningún departamento seleccionado'}
+                {' · '}
+                {rulesInput.eventMode === 'all'
+                  ? 'Todas las Entradas y Salidas'
+                  : rulesInput.eventMode === 'incidents_only'
+                  ? [
+                      rulesInput.notifyOnLateEntry ? 'Retardos' : null,
+                      rulesInput.notifyOnEarlyExit ? 'Salidas tempranas' : null,
+                    ]
+                      .filter(Boolean)
+                      .join(' y ') || 'Ninguna incidencia seleccionada'
+                  : [
+                      rulesInput.notifyOnEntry ? 'Entradas puntuales' : null,
+                      rulesInput.notifyOnLateEntry ? 'Retardos' : null,
+                      rulesInput.notifyOnExit ? 'Salidas regulares' : null,
+                      rulesInput.notifyOnEarlyExit ? 'Salidas tempranas' : null,
+                    ]
+                      .filter(Boolean)
+                      .join(', ') || 'Ningún evento seleccionado'}
+              </p>
+
+              <button
+                type="submit"
+                disabled={settingsSaving}
+                className="inline-flex min-h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap shrink-0"
+              >
+                <Save className="h-3.5 w-3.5" />
+                {settingsSaving ? 'Guardando...' : 'Guardar reglas y configuración'}
+              </button>
+            </div>
+          </div>
+
+          {/* Secret Mode: External Database / Supabase Credentials */}
+          <div className="rounded-xl border border-slate-200 bg-white p-6 lg:col-span-12">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900 text-white">
+                  <Database className="h-5 w-5" />
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <h2 className="font-display text-base font-bold text-slate-900">
+                      Modo Secreto · Base de Datos Externa (Supabase / PostgreSQL)
+                    </h2>
+                    <DatabaseStatusDot showFullLabel />
+                  </div>
+                  <p className="text-xs text-slate-600">
+                    Almacene cifradas con AES-256-GCM las credenciales de Supabase o PostgreSQL (también compatibles con variables de entorno).
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setSecretDbUnlocked((prev) => !prev)}
+                className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 whitespace-nowrap shrink-0"
+              >
+                {secretDbUnlocked ? (
+                  <>
+                    <EyeOff className="h-3.5 w-3.5" />
+                    Ocultar secretos de BD
+                  </>
+                ) : (
+                  <>
+                    <Eye className="h-3.5 w-3.5 text-blue-700" />
+                    Abrir modo secreto
+                  </>
+                )}
+              </button>
+            </div>
+
+            {secretDbUnlocked && (
+              <div className="mt-5 space-y-4 border-t border-slate-100 pt-5">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <div>
+                    <label
+                      htmlFor="cfg-db-provider"
+                      className="block text-sm font-medium text-slate-700"
+                    >
+                      Modo de almacenamiento activo
+                    </label>
+                    <select
+                      id="cfg-db-provider"
+                      value={dbProviderInput}
+                      onChange={(e) =>
+                        setDbProviderInput(e.target.value === 'supabase' ? 'supabase' : 'sqlite')
+                      }
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    >
+                      <option value="sqlite">SQLite Local (controlqr.db)</option>
+                      <option value="supabase">Supabase / PostgreSQL Externo</option>
+                    </select>
+                  </div>
+
+                  <div className="sm:col-span-2">
+                    <label
+                      htmlFor="cfg-supabase-url"
+                      className="block text-sm font-medium text-slate-700"
+                    >
+                      Supabase Project URL
+                    </label>
+                    <input
+                      id="cfg-supabase-url"
+                      type="url"
+                      value={supabaseUrlInput}
+                      onChange={(e) => setSupabaseUrlInput(e.target.value)}
+                      placeholder="https://tu-proyecto.supabase.co"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="cfg-supabase-key"
+                      className="block text-sm font-medium text-slate-700"
+                    >
+                      Supabase API Key (anon o service_role)
+                    </label>
+                    <input
+                      id="cfg-supabase-key"
+                      type="password"
+                      value={supabaseKeyInput}
+                      onChange={(e) => setSupabaseKeyInput(e.target.value)}
+                      placeholder={
+                        settings?.supabase_key_configured
+                          ? '•••••••• (cifrada en servidor, dejar vacío para mantener)'
+                          : 'eyJhbGciOiJIUzI1NiIsInR5cCI6...'
+                      }
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="cfg-database-url"
+                      className="block text-sm font-medium text-slate-700"
+                    >
+                      Cadena PostgreSQL (DATABASE_URL)
+                    </label>
+                    <input
+                      id="cfg-database-url"
+                      type="password"
+                      value={databaseUrlInput}
+                      onChange={(e) => setDatabaseUrlInput(e.target.value)}
+                      placeholder={
+                        settings?.database_url_configured
+                          ? '•••••••• (cifrada en servidor, dejar vacío para mantener)'
+                          : 'postgresql://postgres:password@db.xxx.supabase.co:5432/postgres'
+                      }
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <KeyRound className="h-3.5 w-3.5 text-slate-400" />
+                    <span>
+                      Estado de secretos:{' '}
+                      <strong className="text-slate-700">
+                        {settings?.supabase_key_configured || settings?.database_url_configured
+                          ? 'Credenciales cifradas guardadas'
+                          : 'Sin credenciales externas guardadas'}
+                      </strong>
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleTestSupabase}
+                    disabled={testingSupabase}
+                    className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    <Database className="h-3.5 w-3.5 text-blue-700" />
+                    {testingSupabase ? 'Verificando Supabase...' : 'Probar conexión Supabase'}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </form>
       )}

@@ -3,15 +3,15 @@ services:
     name: controlqr-asistencia
     runtime: node
     plan: free
-    buildCommand: npm install --include=dev && npm run build
-    startCommand: NODE_ENV=production node server.ts
+    buildCommand: npm install && npm run build
+    startCommand: npm start
     healthCheckPath: /api/health
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: NODE_VERSION
-        value: 22.23.2
+        value: 22.21.1
       - key: SMTP_ENCRYPTION_KEY
         generateValue: true
-      - key: DATABASE_URL
-        sync: false
       - key: INITIAL_ADMIN_PIN
         value: "1234"

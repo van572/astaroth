@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ModuleView } from './types';
 import { fetchAuthStatus, logoutAdmin } from './utils/api';
+import { useOfflineSyncStatus } from './utils/offlineSync';
 import { HomeAccessView } from './components/HomeAccessView';
 import { ModuleHeader } from './components/ModuleHeader';
 import { ScannerModule } from './components/ScannerModule';
@@ -9,6 +10,7 @@ import { AdminModule } from './components/AdminModule';
 import { PinModal } from './components/PinModal';
 
 export default function App() {
+  useOfflineSyncStatus();
   const [activeView, setActiveView] = useState<ModuleView>('home');
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   const [isDefaultPin, setIsDefaultPin] = useState(true);
