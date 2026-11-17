@@ -1,4 +1,4 @@
-export type ModuleView = 'home' | 'scanner' | 'register' | 'admin';
+export type ModuleView = 'home' | 'scanner' | 'register' | 'admin' | 'login';
 
 export type MovementType = 'Entrada' | 'Salida';
 
@@ -58,6 +58,8 @@ export interface ScanResponse {
   remainingSeconds?: number;
   lastMovement?: MovementType;
   offlineQueued?: boolean;
+  optimistic?: boolean;
+  latencyMs?: number;
   person?: {
     id: number;
     full_name: string;
@@ -142,11 +144,15 @@ export interface NotificationRules {
   earlyGraceMinutes: number;
 }
 
+export type EmailProvider = 'smtp' | 'brevo' | 'resend';
+
 export interface AppSettings {
   organization_name: string;
   cooldown_seconds: number;
   admin_email: string;
   email_alerts_enabled: boolean;
+  email_provider: EmailProvider;
+  email_api_key_configured: boolean;
   smtp_host: string;
   smtp_port: number;
   smtp_secure: boolean;
@@ -216,4 +222,12 @@ export interface AnalyticsResponse {
   dailyTrends: AnalyticsDailyPoint[];
   hourlyPeaks: AnalyticsHourlyPoint[];
   departmentDistribution: AnalyticsDepartmentPoint[];
+}
+
+export interface AdminUser {
+  id: number;
+  username: string;
+  full_name: string;
+  role: 'superadmin' | 'admin';
+  created_at: string;
 }

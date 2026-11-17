@@ -7,16 +7,42 @@ import { ModuleHeader } from './components/ModuleHeader';
 import { ScannerModule } from './components/ScannerModule';
 import { RegisterModule } from './components/RegisterModule';
 import { AdminModule } from './components/AdminModule';
+import { LoginScreen } from './components/LoginScreen';
 import { PinModal } from './components/PinModal';
+
+const SCANNER_LOCK_KEY = 'controlqr_scanner_locked';
+
+function getStoredScannerLock(): boolean {
+  try {
+    return sessionStorage.getItem(SCANNER_LOCK_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function setStoredScannerLock(locked: boolean): void {
+  try {
+    if (locked) {
+      sessionStorage.setItem(SCANNER_LOCK_KEY, '1');
+    } else {
+      sessionStorage.removeItem(SCANNER_LOCK_KEY);
+    }
+  } catch {
+    // Ignore storage restrictions
+  }
+}
 
 export default function App() {
   useOfflineSyncStatus();
-  const [activeView, setActiveView] = useState<ModuleView>('home');
+  const [authChecking, setAuthChecking] = useState(true);
+  const [activeView, setActiveView] = useState<Exclude<ModuleView, 'login'>>(() =>
+    getStoredScannerLock() ? 'scanner' : 'home'
+  );
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   const [isDefaultPin, setIsDefaultPin] = useState(true);
   const [organizationName, setOrganizationName] = useState('ControlQR Corporativo');
-  const [pendingProtectedTarget, setPendingProtectedTarget] = useState<
-    'register' | 'admin' | null
+  const [pendingExitTarget, setPendingExitTarget] = useState<
+    'home' | 'register' | 'admin' | 'logout' | null
   >(null);
 
   const syncAuthStatus = useCallback(async () => {
@@ -25,32 +51,56 @@ export default function App() {
       setIsAdminAuthenticated(status.authenticated);
       setIsDefaultPin(status.isDefaultPin);
       setOrganizationName(status.organizationName || 'ControlQR Corporativo');
+      if (!status.authenticated && !getStoredScannerLock()) {
+        setActiveView('home');
+      }
     } catch {
       setIsAdminAuthenticated(false);
+    } finally {
+      setAuthChecking(false);
     }
   }, []);
 
   useEffect(() => {
-    syncAuthStatus();
+    void syncAuthStatus();
   }, [syncAuthStatus]);
 
   function handleNavigate(target: ModuleView) {
-    if (target === 'home' || target === 'scanner') {
-      setActiveView(target);
+    if (target === 'login') {
       return;
     }
 
-    // Protected modules: Registro de Personal & Panel de Administración
+    // While inside Scanner mode, ALWAYS require admin password to leave
+    if (activeView === 'scanner' && target !== 'scanner') {
+      setPendingExitTarget(target);
+      return;
+    }
+
+    if (target === 'scanner') {
+      setStoredScannerLock(true);
+      setActiveView('scanner');
+      return;
+    }
+
     if (isAdminAuthenticated) {
       setActiveView(target);
     } else {
-      setPendingProtectedTarget(target);
+      setPendingExitTarget(target);
     }
   }
 
   async function handlePinSuccess() {
-    const target = pendingProtectedTarget;
-    setPendingProtectedTarget(null);
+    const target = pendingExitTarget;
+    setPendingExitTarget(null);
+    setStoredScannerLock(false);
+
+    if (target === 'logout') {
+      await logoutAdmin();
+      setIsAdminAuthenticated(false);
+      setActiveView('home');
+      return;
+    }
+
     setIsAdminAuthenticated(true);
     await syncAuthStatus();
     if (target) {
@@ -59,16 +109,44 @@ export default function App() {
   }
 
   async function handleLockSession() {
+    if (activeView === 'scanner') {
+      setPendingExitTarget('logout');
+      return;
+    }
+    setStoredScannerLock(false);
     await logoutAdmin();
     setIsAdminAuthenticated(false);
-    if (activeView === 'register' || activeView === 'admin') {
-      setActiveView('home');
-    }
+    setActiveView('home');
   }
 
   function handleAuthExpired() {
     setIsAdminAuthenticated(false);
-    setPendingProtectedTarget(activeView === 'register' ? 'register' : 'admin');
+    setStoredScannerLock(false);
+    setActiveView('home');
+  }
+
+  if (authChecking) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm font-medium text-slate-600">
+        Verificando acceso al sistema...
+      </div>
+    );
+  }
+
+  // Block ALL functions behind the Login gate until authenticated (unless kiosk scanner was locked in this tab)
+  const isLockedKioskActive = activeView === 'scanner' && getStoredScannerLock();
+  if (!isAdminAuthenticated && !isLockedKioskActive) {
+    return (
+      <LoginScreen
+        organizationName={organizationName}
+        isDefaultPin={isDefaultPin}
+        onLoginSuccess={() => {
+          setIsAdminAuthenticated(true);
+          setActiveView('home');
+          void syncAuthStatus();
+        }}
+      />
+    );
   }
 
   return (
@@ -105,16 +183,20 @@ export default function App() {
         </>
       )}
 
-      {pendingProtectedTarget && (
+      {pendingExitTarget && (
         <PinModal
           targetLabel={
-            pendingProtectedTarget === 'register'
+            pendingExitTarget === 'register'
               ? 'Registro de Personal'
-              : 'Panel de Administración'
+              : pendingExitTarget === 'admin'
+              ? 'Panel de Administración'
+              : pendingExitTarget === 'logout'
+              ? 'Cerrar Sesión y Salir del Escáner'
+              : 'Salir del Modo Escáner'
           }
           isDefaultPin={isDefaultPin}
           onSuccess={handlePinSuccess}
-          onCancel={() => setPendingProtectedTarget(null)}
+          onCancel={() => setPendingExitTarget(null)}
         />
       )}
     </div>

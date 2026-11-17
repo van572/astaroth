@@ -25,6 +25,43 @@ export interface CachedTerminalMeta {
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null;
+const memoryPersonnelMap = new Map<string, CachedScannerPerson>();
+let memoryHydrated = false;
+let memoryMeta: CachedTerminalMeta = {
+  cooldownSeconds: 15,
+  organizationName: 'ControlQR Corporativo',
+  lastDirectorySyncAt: null,
+  cachedCount: 0,
+};
+
+export function getCachedPersonFromMemory(qrToken: string): CachedScannerPerson | undefined {
+  return memoryPersonnelMap.get(qrToken);
+}
+
+export function getCachedMetaFromMemory(): CachedTerminalMeta {
+  return memoryMeta;
+}
+
+export function isScannerMemoryHydrated(): boolean {
+  return memoryHydrated;
+}
+
+export function updateMemoryPersonMovement(
+  qrToken: string,
+  movementType: MovementType,
+  localDate: string,
+  scannedAt: string
+): void {
+  const existing = memoryPersonnelMap.get(qrToken);
+  if (existing) {
+    memoryPersonnelMap.set(qrToken, {
+      ...existing,
+      last_movement_today: movementType,
+      last_movement_date: localDate,
+      last_scanned_at: scannedAt,
+    });
+  }
+}
 
 function openOfflineDb(): Promise<IDBDatabase> {
   if (typeof indexedDB === 'undefined') {
@@ -131,7 +168,7 @@ export async function getCachedTerminalMeta(): Promise<CachedTerminalMeta> {
       requestToPromise(personStore.count()),
     ]);
 
-    return {
+    const resultMeta: CachedTerminalMeta = {
       cooldownSeconds:
         typeof cooldownRec?.value === 'number' && cooldownRec.value >= 5
           ? cooldownRec.value
@@ -143,14 +180,112 @@ export async function getCachedTerminalMeta(): Promise<CachedTerminalMeta> {
       lastDirectorySyncAt: typeof syncRec?.value === 'string' ? syncRec.value : null,
       cachedCount: cachedCount || 0,
     };
+    memoryMeta = resultMeta;
+    return resultMeta;
   } catch {
+    return memoryMeta;
+  }
+}
+
+export async function hydrateScannerMemoryCache(): Promise<void> {
+  if (memoryHydrated) return;
+  try {
+    const db = await openOfflineDb();
+    const tx = db.transaction([STORE_PERSONNEL, STORE_META], 'readonly');
+    const personStore = tx.objectStore(STORE_PERSONNEL);
+    const metaStore = tx.objectStore(STORE_META);
+
+    const [allPeople, cooldownRec, orgRec, syncRec] = await Promise.all([
+      requestToPromise(personStore.getAll() as IDBRequest<CachedScannerPerson[]>),
+      requestToPromise(metaStore.get('cooldownSeconds') as IDBRequest<TerminalMetaRecord | undefined>),
+      requestToPromise(metaStore.get('organizationName') as IDBRequest<TerminalMetaRecord | undefined>),
+      requestToPromise(metaStore.get('lastDirectorySyncAt') as IDBRequest<TerminalMetaRecord | undefined>),
+    ]);
+
+    memoryPersonnelMap.clear();
+    for (const p of allPeople || []) {
+      memoryPersonnelMap.set(p.qr_token, p);
+    }
+    memoryMeta = {
+      cooldownSeconds:
+        typeof cooldownRec?.value === 'number' && cooldownRec.value >= 5
+          ? cooldownRec.value
+          : 15,
+      organizationName:
+        typeof orgRec?.value === 'string' && orgRec.value
+          ? orgRec.value
+          : 'ControlQR Corporativo',
+      lastDirectorySyncAt: typeof syncRec?.value === 'string' ? syncRec.value : null,
+      cachedCount: memoryPersonnelMap.size,
+    };
+    memoryHydrated = true;
+  } catch {
+    // Ignore IDB hydration errors
+  }
+}
+
+export function predictInstantScanFromMemory(
+  qrToken: string,
+  localDate: string,
+  localTime: string
+): ScanResponse | null {
+  if (!memoryHydrated) return null;
+  const person = memoryPersonnelMap.get(qrToken);
+  if (!person) return null;
+
+  const publicPerson = {
+    id: person.id,
+    full_name: person.full_name,
+    document_id: person.document_id,
+    role_department: person.role_department,
+    photo_data: person.photo_data,
+    is_active: person.is_active,
+  };
+
+  if (person.is_active === 0) {
     return {
-      cooldownSeconds: 15,
-      organizationName: 'ControlQR Corporativo',
-      lastDirectorySyncAt: null,
-      cachedCount: 0,
+      status: 'inactive',
+      optimistic: true,
+      message: 'Carnet desactivado. Acceso denegado.',
+      person: publicPerson,
     };
   }
+
+  const cooldownSeconds = memoryMeta.cooldownSeconds || 15;
+  if (person.last_scanned_at) {
+    const elapsedMs = Date.now() - Date.parse(person.last_scanned_at);
+    const cooldownMs = cooldownSeconds * 1000;
+    if (elapsedMs >= 0 && elapsedMs < cooldownMs) {
+      const remainingSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
+      return {
+        status: 'cooldown',
+        remainingSeconds,
+        cooldownSeconds,
+        lastMovement: person.last_movement_today || undefined,
+        optimistic: true,
+        message: `Lectura duplicada bloqueada. Espere ${remainingSeconds}s antes de volver a escanear.`,
+        person: publicPerson,
+      };
+    }
+  }
+
+  const lastMovementOnSameDay =
+    person.last_movement_date === localDate ? person.last_movement_today : null;
+  const movementType: MovementType =
+    !lastMovementOnSameDay || lastMovementOnSameDay === 'Salida' ? 'Entrada' : 'Salida';
+  const scannedAt = new Date().toISOString();
+
+  return {
+    status: 'success',
+    movementType,
+    scannedAt,
+    localDate,
+    localTime,
+    cooldownSeconds,
+    optimistic: true,
+    message: `${movementType} registrada correctamente.`,
+    person: publicPerson,
+  };
 }
 
 export async function saveScannerBootstrap(snapshot: ScannerBootstrapResponse): Promise<void> {
@@ -172,6 +307,7 @@ export async function saveScannerBootstrap(snapshot: ScannerBootstrapResponse): 
 
   personStore.clear();
 
+  memoryPersonnelMap.clear();
   for (const p of snapshot.personnel) {
     const pendingOverlay = latestPendingByToken.get(p.qr_token);
     const serverMs = p.last_scanned_at ? Date.parse(p.last_scanned_at) : 0;
@@ -197,8 +333,17 @@ export async function saveScannerBootstrap(snapshot: ScannerBootstrapResponse): 
       last_scanned_at: usePending ? pendingOverlay!.scannedAt : p.last_scanned_at,
     };
 
+    memoryPersonnelMap.set(p.qr_token, cachedPerson);
     personStore.put(cachedPerson);
   }
+
+  memoryMeta = {
+    cooldownSeconds: snapshot.cooldownSeconds,
+    organizationName: snapshot.organizationName,
+    lastDirectorySyncAt: snapshot.syncedAt,
+    cachedCount: snapshot.personnel.length,
+  };
+  memoryHydrated = true;
 
   metaStore.put({ key: 'cooldownSeconds', value: snapshot.cooldownSeconds });
   metaStore.put({ key: 'organizationName', value: snapshot.organizationName });
@@ -213,6 +358,7 @@ export async function updateCachedPersonMovement(
   localDate: string,
   scannedAt: string
 ): Promise<void> {
+  updateMemoryPersonMovement(qrToken, movementType, localDate, scannedAt);
   try {
     const db = await openOfflineDb();
     const tx = db.transaction(STORE_PERSONNEL, 'readwrite');
@@ -317,12 +463,14 @@ export async function recordOfflineScanInIdb(
 
   const writeTx = db.transaction([STORE_PENDING_SCANS, STORE_PERSONNEL], 'readwrite');
   writeTx.objectStore(STORE_PENDING_SCANS).put(pendingItem);
-  writeTx.objectStore(STORE_PERSONNEL).put({
+  const updatedPerson: CachedScannerPerson = {
     ...person,
     last_movement_today: movementType,
     last_movement_date: localDate,
     last_scanned_at: scannedAt,
-  });
+  };
+  writeTx.objectStore(STORE_PERSONNEL).put(updatedPerson);
+  memoryPersonnelMap.set(qrToken, updatedPerson);
   await transactionDone(writeTx);
 
   return {
@@ -335,6 +483,66 @@ export async function recordOfflineScanInIdb(
     offlineQueued: true,
     message: `${movementType} guardada localmente. Se sincronizará al recuperar conexión.`,
     person: publicPerson,
+  };
+}
+
+export async function queueOptimisticScanOffline(params: {
+  qrToken: string;
+  movementType: MovementType;
+  scannedAt: string;
+  localDate: string;
+  localTime: string;
+}): Promise<ScanResponse> {
+  const db = await openOfflineDb();
+  const person = memoryPersonnelMap.get(params.qrToken);
+  if (!person) {
+    return recordOfflineScanInIdb(params.qrToken, params.localDate, params.localTime);
+  }
+
+  const pendingItem: PendingOfflineScan = {
+    clientScanId: generateClientScanId(),
+    qrToken: params.qrToken,
+    personId: person.id,
+    fullName: person.full_name,
+    documentId: person.document_id,
+    roleDepartment: person.role_department,
+    movementType: params.movementType,
+    scannedAt: params.scannedAt,
+    localDate: params.localDate,
+    localTime: params.localTime,
+    attempts: 0,
+  };
+
+  const updatedPerson: CachedScannerPerson = {
+    ...person,
+    last_movement_today: params.movementType,
+    last_movement_date: params.localDate,
+    last_scanned_at: params.scannedAt,
+  };
+  memoryPersonnelMap.set(params.qrToken, updatedPerson);
+
+  const writeTx = db.transaction([STORE_PENDING_SCANS, STORE_PERSONNEL], 'readwrite');
+  writeTx.objectStore(STORE_PENDING_SCANS).put(pendingItem);
+  writeTx.objectStore(STORE_PERSONNEL).put(updatedPerson);
+  await transactionDone(writeTx);
+
+  return {
+    status: 'success',
+    movementType: params.movementType,
+    scannedAt: params.scannedAt,
+    localDate: params.localDate,
+    localTime: params.localTime,
+    cooldownSeconds: memoryMeta.cooldownSeconds || 15,
+    offlineQueued: true,
+    message: `${params.movementType} guardada localmente. Se sincronizará al recuperar conexión.`,
+    person: {
+      id: person.id,
+      full_name: person.full_name,
+      document_id: person.document_id,
+      role_department: person.role_department,
+      photo_data: person.photo_data,
+      is_active: person.is_active,
+    },
   };
 }
 

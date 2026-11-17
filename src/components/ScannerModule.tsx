@@ -28,10 +28,12 @@ import {
   Volume2,
   VolumeX,
   Wifi,
+  Zap,
 } from 'lucide-react';
 import type { ScanResponse } from '../types';
 import { getCachedTerminalMeta } from '../utils/offlineDb';
 import {
+  submitQrScanTurbo,
   submitQrScanWithOfflineFallback,
   useOfflineSyncStatus,
 } from '../utils/offlineSync';
@@ -71,22 +73,38 @@ interface NativeBarcodeDetectorConstructor {
   getSupportedFormats?: () => Promise<string[]>;
 }
 
+interface WorkerDecodeResult {
+  id: number;
+  data: string | null;
+  location: {
+    topLeftCorner: QrCornerPoint;
+    topRightCorner: QrCornerPoint;
+    bottomRightCorner: QrCornerPoint;
+    bottomLeftCorner: QrCornerPoint;
+  } | null;
+}
+
 type FlashTone = 'none' | 'success' | 'cooldown' | 'error';
 
 const AUTO_IDLE_RESET_MS = 10000;
+const TURBO_STORAGE_KEY = 'controlqr_scanner_turbo';
 
 export function ScannerModule() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const analysisCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const barcodeDetectorRef = useRef<NativeBarcodeDetectorInstance | null>(null);
+  const qrWorkerRef = useRef<Worker | null>(null);
+  const workerReqIdRef = useRef<number>(0);
+  const workerPendingRef = useRef<Map<number, (result: WorkerDecodeResult) => void>>(new Map());
 
-  // Anti-rebote client guard + concurrency lock
+  // Anti-rebote client guard + per-token concurrency set (allows rapid multi-person queue)
   const localDebounceRef = useRef<Map<string, number>>(new Map());
-  const processingRef = useRef<boolean>(false);
+  const inFlightTokensRef = useRef<Set<string>>(new Set());
   const frameTickRef = useRef<number>(0);
   const lastPolygonRef = useRef<{
     points: QrCornerPoint[];
@@ -101,6 +119,13 @@ export function ScannerModule() {
   const [cameraState, setCameraState] = useState<'starting' | 'active' | 'error'>('starting');
   const [cameraError, setCameraError] = useState<string>('');
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [turboMode, setTurboMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(TURBO_STORAGE_KEY) !== 'false';
+    } catch {
+      return true;
+    }
+  });
   const [mirrored, setMirrored] = useState<boolean>(false);
   const [torchSupported, setTorchSupported] = useState<boolean>(false);
   const [torchOn, setTorchOn] = useState<boolean>(false);
@@ -108,7 +133,7 @@ export function ScannerModule() {
   const [isDraggingFile, setIsDraggingFile] = useState<boolean>(false);
   const [manualOpen, setManualOpen] = useState<boolean>(false);
   const [manualCode, setManualCode] = useState<string>('');
-  const [decoderEngine, setDecoderEngine] = useState<'native' | 'jsqr'>('jsqr');
+  const [decoderEngine, setDecoderEngine] = useState<'native' | 'worker' | 'jsqr'>('jsqr');
 
   const [cooldownSeconds, setCooldownSeconds] = useState<number>(15);
   const [now, setNow] = useState(() => new Date());
@@ -129,35 +154,75 @@ export function ScannerModule() {
     refreshCache,
   } = useOfflineSyncStatus();
 
-  // Initialize native BarcodeDetector when supported by browser
+  // Initialize native BarcodeDetector and background Web Worker decoder
   useEffect(() => {
+    let cancelled = false;
+    let workerInstance: Worker | null = null;
+
+    if (typeof Worker !== 'undefined') {
+      try {
+        workerInstance = new Worker(
+          new URL('../workers/qrDecoder.worker.ts', import.meta.url),
+          { type: 'module' }
+        );
+        workerInstance.onmessage = (event: MessageEvent<WorkerDecodeResult>) => {
+          const cb = workerPendingRef.current.get(event.data.id);
+          if (cb) {
+            workerPendingRef.current.delete(event.data.id);
+            cb(event.data);
+          }
+        };
+        workerInstance.onerror = () => {
+          for (const [id, cb] of workerPendingRef.current.entries()) {
+            workerPendingRef.current.delete(id);
+            cb({ id, data: null, location: null });
+          }
+          qrWorkerRef.current = null;
+        };
+        qrWorkerRef.current = workerInstance;
+      } catch {
+        qrWorkerRef.current = null;
+      }
+    }
+
     const win = window as unknown as {
       BarcodeDetector?: NativeBarcodeDetectorConstructor;
     };
     const DetectorCtor = win.BarcodeDetector;
     if (!DetectorCtor) {
-      setDecoderEngine('jsqr');
-      return;
+      setDecoderEngine(qrWorkerRef.current ? 'worker' : 'jsqr');
+      return () => {
+        cancelled = true;
+        workerPendingRef.current.clear();
+        workerInstance?.terminate();
+        qrWorkerRef.current = null;
+      };
     }
 
-    let cancelled = false;
     const initDetector = async () => {
       try {
         if (DetectorCtor.getSupportedFormats) {
           const formats = await DetectorCtor.getSupportedFormats();
-          if (!formats.includes('qr_code')) return;
+          if (!formats.includes('qr_code')) {
+            if (!cancelled) setDecoderEngine(qrWorkerRef.current ? 'worker' : 'jsqr');
+            return;
+          }
         }
         if (!cancelled) {
           barcodeDetectorRef.current = new DetectorCtor({ formats: ['qr_code'] });
           setDecoderEngine('native');
         }
       } catch {
-        if (!cancelled) setDecoderEngine('jsqr');
+        if (!cancelled) setDecoderEngine(qrWorkerRef.current ? 'worker' : 'jsqr');
       }
     };
     initDetector();
+
     return () => {
       cancelled = true;
+      workerPendingRef.current.clear();
+      workerInstance?.terminate();
+      qrWorkerRef.current = null;
     };
   }, []);
 
@@ -270,8 +335,18 @@ export function ScannerModule() {
       try {
         const constraints: MediaStreamConstraints = {
           video: deviceId
-            ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-            : { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+            ? {
+                deviceId: { exact: deviceId },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 30, min: 15 },
+              }
+            : {
+                facingMode: 'environment',
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 30, min: 15 },
+              },
           audio: false,
         };
 
@@ -367,53 +442,80 @@ export function ScannerModule() {
       videoDims?: { w: number; h: number }
     ) => {
       const cleaned = qrToken.trim();
-      if (!cleaned || processingRef.current) return;
+      if (!cleaned || inFlightTokensRef.current.has(cleaned)) return;
 
       const nowMs = Date.now();
       const lastHit = localDebounceRef.current.get(cleaned) || 0;
-      if (source === 'camera' && nowMs - lastHit < 2200) {
+      if (source === 'camera' && nowMs - lastHit < 1500) {
         if (detectedPoints && videoDims) {
           lastPolygonRef.current = {
             points: detectedPoints,
             videoW: videoDims.w,
             videoH: videoDims.h,
             tone: lastPolygonRef.current?.tone || 'cooldown',
-            expiresAt: nowMs + 350,
+            expiresAt: nowMs + 300,
           };
         }
         return;
       }
 
       localDebounceRef.current.set(cleaned, nowMs);
-      processingRef.current = true;
+      inFlightTokensRef.current.add(cleaned);
 
-      try {
-        const res = await submitQrScanWithOfflineFallback(cleaned);
+      const applyScanFeedback = (
+        res: ScanResponse,
+        options?: { skipSound?: boolean; replaceFeedId?: string }
+      ): string | undefined => {
         setLastResult(res);
         setResultTimestamp(Date.now());
 
         let tone: FlashTone = 'error';
+        let createdFeedId: string | undefined;
+
         if (res.status === 'success' && res.movementType && res.person) {
           tone = 'success';
           setCooldownRemaining(res.cooldownSeconds || cooldownSeconds);
-          if (soundEnabled) playSuccessSound(res.movementType);
-          setRecentFeed((prev) => [
-            {
-              id: `${Date.now()}-${Math.random()}`,
-              fullName: res.person!.full_name,
-              documentId: res.person!.document_id,
-              movementType: res.movementType!,
-              time: res.localTime || new Date().toLocaleTimeString('es-ES', { hour12: false }),
-              offlineQueued: res.offlineQueued,
-            },
-            ...prev.slice(0, 7),
-          ]);
+          if (soundEnabled && !options?.skipSound) playSuccessSound(res.movementType);
+
+          if (options?.replaceFeedId) {
+            setRecentFeed((prev) =>
+              prev.map((entry) =>
+                entry.id === options.replaceFeedId
+                  ? {
+                      ...entry,
+                      movementType: res.movementType!,
+                      time: res.localTime || entry.time,
+                      offlineQueued: res.offlineQueued,
+                    }
+                  : entry
+              )
+            );
+          } else {
+            createdFeedId = `${Date.now()}-${Math.random()}`;
+            setRecentFeed((prev) => [
+              {
+                id: createdFeedId!,
+                fullName: res.person!.full_name,
+                documentId: res.person!.document_id,
+                movementType: res.movementType!,
+                time: res.localTime || new Date().toLocaleTimeString('es-ES', { hour12: false }),
+                offlineQueued: res.offlineQueued,
+              },
+              ...prev.slice(0, 7),
+            ]);
+          }
         } else if (res.status === 'cooldown') {
           tone = 'cooldown';
-          if (soundEnabled) playCooldownSound();
+          if (soundEnabled && !options?.skipSound) playCooldownSound();
+          if (options?.replaceFeedId) {
+            setRecentFeed((prev) => prev.filter((entry) => entry.id !== options.replaceFeedId));
+          }
         } else {
           tone = 'error';
-          if (soundEnabled) playErrorSound();
+          if (soundEnabled && !options?.skipSound) playErrorSound();
+          if (options?.replaceFeedId) {
+            setRecentFeed((prev) => prev.filter((entry) => entry.id !== options.replaceFeedId));
+          }
         }
 
         setFlashTone(tone);
@@ -423,9 +525,30 @@ export function ScannerModule() {
             videoW: videoDims.w,
             videoH: videoDims.h,
             tone,
-            expiresAt: Date.now() + 900,
+            expiresAt: Date.now() + 850,
           };
         }
+
+        return createdFeedId;
+      };
+
+      try {
+        let initialFeedId: string | undefined;
+        let initialStatus: ScanResponse['status'] | undefined;
+
+        const res = turboMode
+          ? await submitQrScanTurbo(cleaned, (reconciled) => {
+              const skipSound =
+                reconciled.status === 'success' && initialStatus === 'success';
+              applyScanFeedback(reconciled, {
+                skipSound,
+                replaceFeedId: initialFeedId,
+              });
+            })
+          : await submitQrScanWithOfflineFallback(cleaned);
+
+        initialStatus = res.status;
+        initialFeedId = applyScanFeedback(res);
       } catch {
         setLastResult({
           status: 'invalid',
@@ -435,10 +558,10 @@ export function ScannerModule() {
         setFlashTone('error');
         if (soundEnabled) playErrorSound();
       } finally {
-        processingRef.current = false;
+        inFlightTokensRef.current.delete(cleaned);
       }
     },
-    [cooldownSeconds, soundEnabled]
+    [cooldownSeconds, soundEnabled, turboMode]
   );
 
   // Keyboard-wedge support for physical USB / Bluetooth 2D QR scanners
@@ -543,23 +666,60 @@ export function ScannerModule() {
     ctx.restore();
   }, [mirrored]);
 
-  // Optimized continuous real-time scanning loop (Native BarcodeDetector + jsQR fallback)
+  // High-FPS continuous scanning loop (Hardware BarcodeDetector or Web Worker ROI-first jsQR)
   useEffect(() => {
     if (cameraState !== 'active') return;
 
     let rafId = 0;
     let lastScanTime = 0;
     let inFlightDetect = false;
+    let cancelled = false;
+
+    const decodeViaWorkerOrMain = (
+      imageData: ImageData,
+      width: number,
+      height: number,
+      inversionAttempts: 'dontInvert' | 'onlyInvert' | 'attemptBoth'
+    ): Promise<Omit<WorkerDecodeResult, 'id'>> => {
+      const worker = qrWorkerRef.current;
+      if (worker) {
+        const reqId = ++workerReqIdRef.current;
+        return new Promise((resolve) => {
+          workerPendingRef.current.set(reqId, (res) => {
+            resolve({ data: res.data, location: res.location });
+          });
+          const buffer = imageData.data.buffer;
+          worker.postMessage(
+            { id: reqId, width, height, buffer, inversionAttempts },
+            [buffer]
+          );
+        });
+      }
+      const decoded = jsQR(imageData.data, width, height, { inversionAttempts });
+      return Promise.resolve({
+        data: decoded?.data ?? null,
+        location: decoded?.location
+          ? {
+              topLeftCorner: decoded.location.topLeftCorner,
+              topRightCorner: decoded.location.topRightCorner,
+              bottomRightCorner: decoded.location.bottomRightCorner,
+              bottomLeftCorner: decoded.location.bottomLeftCorner,
+            }
+          : null,
+      });
+    };
 
     const scanFrame = (timestamp: number) => {
+      if (cancelled) return;
       drawOverlayPolygon();
 
-      if (!inFlightDetect && timestamp - lastScanTime >= 90) {
+      const minIntervalMs = barcodeDetectorRef.current ? 28 : 32;
+      if (!inFlightDetect && timestamp - lastScanTime >= minIntervalMs) {
         lastScanTime = timestamp;
         const video = videoRef.current;
         const canvas = analysisCanvasRef.current;
 
-        if (video && canvas && video.readyState === video.HAVE_ENOUGH_DATA) {
+        if (video && canvas && video.readyState >= video.HAVE_CURRENT_DATA) {
           const vw = video.videoWidth;
           const vh = video.videoHeight;
 
@@ -572,75 +732,79 @@ export function ScannerModule() {
                   const first = results.find((r) => Boolean(r.rawValue));
                   if (first?.rawValue) {
                     const pts = first.cornerPoints?.map((p) => ({ x: p.x, y: p.y }));
-                    handleDecodedToken(first.rawValue, 'camera', pts, { w: vw, h: vh });
+                    void handleDecodedToken(first.rawValue, 'camera', pts, { w: vw, h: vh });
                   }
                 })
                 .catch(() => {
-                  // Fallback silently if detector fails on a frame
+                  // Ignore transient frame decode failure
                 })
                 .finally(() => {
                   inFlightDetect = false;
                 });
             } else {
-              // Fast downscaled jsQR pass (max 640px wide) + periodic center ROI & inversion pass
+              // Smart ROI-first strategy inside non-blocking Web Worker
               const tick = ++frameTickRef.current;
-              const targetW = Math.min(640, vw);
-              const scale = targetW / vw;
-              const targetH = Math.round(vh * scale);
+              const useFullFrame = tick % 3 === 0 || vw <= 480;
+              const inversion: 'dontInvert' | 'attemptBoth' =
+                tick % 6 === 0 ? 'attemptBoth' : 'dontInvert';
 
-              canvas.width = targetW;
-              canvas.height = targetH;
-              const ctx = canvas.getContext('2d', { willReadFrequently: true });
+              if (!analysisCtxRef.current) {
+                analysisCtxRef.current = canvas.getContext('2d', { willReadFrequently: true });
+              }
+              const ctx = analysisCtxRef.current;
 
               if (ctx) {
-                ctx.drawImage(video, 0, 0, targetW, targetH);
-                const imageData = ctx.getImageData(0, 0, targetW, targetH);
-                const inversion = tick % 3 === 0 ? 'attemptBoth' : 'dontInvert';
+                let targetW: number;
+                let targetH: number;
+                let sx = 0;
+                let sy = 0;
+                let sw = vw;
+                let sh = vh;
 
-                let decoded = jsQR(imageData.data, targetW, targetH, {
-                  inversionAttempts: inversion,
-                });
-
-                let pts: QrCornerPoint[] | undefined;
-                if (decoded?.location) {
-                  const loc = decoded.location;
-                  pts = [
-                    { x: loc.topLeftCorner.x / scale, y: loc.topLeftCorner.y / scale },
-                    { x: loc.topRightCorner.x / scale, y: loc.topRightCorner.y / scale },
-                    { x: loc.bottomRightCorner.x / scale, y: loc.bottomRightCorner.y / scale },
-                    { x: loc.bottomLeftCorner.x / scale, y: loc.bottomLeftCorner.y / scale },
-                  ];
-                }
-
-                // Center-crop high-detail pass every 2nd frame if full frame missed
-                if (!decoded && tick % 2 === 0 && vw > 640) {
+                if (useFullFrame) {
+                  targetW = Math.min(480, vw);
+                  targetH = Math.max(1, Math.round(vh * (targetW / vw)));
+                } else {
+                  // Center viewfinder ROI (62% of min dimension -> ultra-fast 384x384 decode)
                   const cropSize = Math.round(Math.min(vw, vh) * 0.62);
-                  const sx = Math.round((vw - cropSize) / 2);
-                  const sy = Math.round((vh - cropSize) / 2);
-                  const outSize = 480;
-                  canvas.width = outSize;
-                  canvas.height = outSize;
-                  ctx.drawImage(video, sx, sy, cropSize, cropSize, 0, 0, outSize, outSize);
-                  const cropData = ctx.getImageData(0, 0, outSize, outSize);
-                  decoded = jsQR(cropData.data, outSize, outSize, {
-                    inversionAttempts: 'attemptBoth',
+                  sx = Math.round((vw - cropSize) / 2);
+                  sy = Math.round((vh - cropSize) / 2);
+                  sw = cropSize;
+                  sh = cropSize;
+                  targetW = 384;
+                  targetH = 384;
+                }
+
+                if (canvas.width !== targetW || canvas.height !== targetH) {
+                  canvas.width = targetW;
+                  canvas.height = targetH;
+                }
+
+                ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH);
+                const imageData = ctx.getImageData(0, 0, targetW, targetH);
+                const scaleX = targetW / sw;
+                const scaleY = targetH / sh;
+
+                inFlightDetect = true;
+                decodeViaWorkerOrMain(imageData, targetW, targetH, inversion)
+                  .then((decoded) => {
+                    if (decoded.data) {
+                      let pts: QrCornerPoint[] | undefined;
+                      if (decoded.location) {
+                        const loc = decoded.location;
+                        pts = [
+                          { x: sx + loc.topLeftCorner.x / scaleX, y: sy + loc.topLeftCorner.y / scaleY },
+                          { x: sx + loc.topRightCorner.x / scaleX, y: sy + loc.topRightCorner.y / scaleY },
+                          { x: sx + loc.bottomRightCorner.x / scaleX, y: sy + loc.bottomRightCorner.y / scaleY },
+                          { x: sx + loc.bottomLeftCorner.x / scaleX, y: sy + loc.bottomLeftCorner.y / scaleY },
+                        ];
+                      }
+                      void handleDecodedToken(decoded.data, 'camera', pts, { w: vw, h: vh });
+                    }
+                  })
+                  .finally(() => {
+                    inFlightDetect = false;
                   });
-
-                  if (decoded?.location) {
-                    const cScale = outSize / cropSize;
-                    const loc = decoded.location;
-                    pts = [
-                      { x: sx + loc.topLeftCorner.x / cScale, y: sy + loc.topLeftCorner.y / cScale },
-                      { x: sx + loc.topRightCorner.x / cScale, y: sy + loc.topRightCorner.y / cScale },
-                      { x: sx + loc.bottomRightCorner.x / cScale, y: sy + loc.bottomRightCorner.y / cScale },
-                      { x: sx + loc.bottomLeftCorner.x / cScale, y: sy + loc.bottomLeftCorner.y / cScale },
-                    ];
-                  }
-                }
-
-                if (decoded?.data) {
-                  handleDecodedToken(decoded.data, 'camera', pts, { w: vw, h: vh });
-                }
               }
             }
           }
@@ -650,7 +814,10 @@ export function ScannerModule() {
     };
 
     rafId = requestAnimationFrame(scanFrame);
-    return () => cancelAnimationFrame(rafId);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafId);
+    };
   }, [cameraState, drawOverlayPolygon, handleDecodedToken]);
 
   const decodeImageFile = useCallback(
@@ -674,12 +841,14 @@ export function ScannerModule() {
             }
           }
 
+          const maxDim = 1200;
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
           const canvas = document.createElement('canvas');
-          canvas.width = img.width;
-          canvas.height = img.height;
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
           const ctx = canvas.getContext('2d');
           if (!ctx) return;
-          ctx.drawImage(img, 0, 0);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
           const decoded = jsQR(imageData.data, canvas.width, canvas.height, {
             inversionAttempts: 'attemptBoth',
@@ -771,7 +940,14 @@ export function ScannerModule() {
             </span>
             <span className="mx-2 text-slate-300" aria-hidden="true">·</span>
             <span>
-              Motor: <strong className="font-medium text-slate-800">{decoderEngine === 'native' ? 'Acelerado (Hardware)' : 'Óptico (jsQR)'}</strong>
+              Motor:{' '}
+              <strong className="font-medium text-slate-800">
+                {decoderEngine === 'native'
+                  ? 'Hardware (35 fps)'
+                  : decoderEngine === 'worker'
+                  ? 'Worker 2º plano (30 fps)'
+                  : 'Óptico (jsQR)'}
+              </strong>
             </span>
             <span className="mx-2 text-slate-300" aria-hidden="true">·</span>
             <span className="inline-flex items-center gap-1">
@@ -809,6 +985,35 @@ export function ScannerModule() {
           <div className="rounded-lg border border-slate-200 bg-white px-4 py-2 font-mono text-lg font-bold text-slate-900 tabular-nums">
             {formattedClock}
           </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              unlockAudio();
+              setTurboMode((prev) => {
+                const next = !prev;
+                try {
+                  localStorage.setItem(TURBO_STORAGE_KEY, String(next));
+                } catch {
+                  // Ignore storage errors
+                }
+                return next;
+              });
+            }}
+            title={
+              turboMode
+                ? 'Valida al instante desde caché local y sincroniza con el servidor en segundo plano'
+                : 'Espera la confirmación directa del servidor antes de registrar la lectura'
+            }
+            className={`inline-flex min-h-10 items-center gap-2 rounded-lg border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              turboMode
+                ? 'border-emerald-600 bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+                : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+            }`}
+          >
+            <Zap className={`h-4 w-4 ${turboMode ? 'text-emerald-600' : 'text-slate-400'}`} />
+            {turboMode ? 'Validación rápida' : 'Validación directa'}
+          </button>
 
           <button
             type="button"
@@ -1101,16 +1306,23 @@ export function ScannerModule() {
             ) : lastResult.status === 'success' && lastResult.person ? (
               <div>
                 {/* Green Success Header */}
-                <div className="flex items-center justify-between rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-emerald-900">
+                <div className="flex items-center justify-between gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-emerald-900">
                   <div className="flex items-center gap-2.5">
                     <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-700" />
                     <span className="font-display text-sm font-bold uppercase tracking-wide">
                       {lastResult.movementType} registrada
                     </span>
                   </div>
-                  <span className="font-mono text-sm font-bold tabular-nums">
-                    {lastResult.localTime}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {typeof lastResult.latencyMs === 'number' && (
+                      <span className="rounded bg-emerald-100 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-800 tabular-nums">
+                        {lastResult.latencyMs} ms
+                      </span>
+                    )}
+                    <span className="font-mono text-sm font-bold tabular-nums">
+                      {lastResult.localTime}
+                    </span>
+                  </div>
                 </div>
 
                 {lastResult.offlineQueued && (

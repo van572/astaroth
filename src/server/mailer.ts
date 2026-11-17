@@ -1,7 +1,10 @@
+import dns from 'node:dns';
+import net from 'node:net';
 import nodemailer from 'nodemailer';
 import { execute, getResolvedSettingsMap } from './db.ts';
 
 const SMTP_SEND_TIMEOUT_MS = 18000;
+const HTTP_API_TIMEOUT_MS = 15000;
 
 export interface MovementEmailPayload {
   logId: number;
@@ -13,26 +16,177 @@ export interface MovementEmailPayload {
   localTime: string;
 }
 
-function buildTransporter(settings: Record<string, string>) {
-  const host = (settings.smtp_host || '').trim();
-  const port = Number(settings.smtp_port || '587');
-  const secure = settings.smtp_secure === 'true';
+export type EmailProvider = 'smtp' | 'brevo' | 'resend';
+
+export function getEmailProvider(settings: Record<string, string>): EmailProvider {
+  if (settings.email_provider === 'brevo') return 'brevo';
+  if (settings.email_provider === 'resend') return 'resend';
+  return 'smtp';
+}
+
+async function resolveIpv4Host(hostname: string): Promise<string> {
+  if (!hostname || net.isIP(hostname) !== 0) {
+    return hostname;
+  }
+  try {
+    const resolved = await dns.promises.lookup(hostname, { family: 4 });
+    return resolved.address || hostname;
+  } catch {
+    return hostname;
+  }
+}
+
+async function buildTransporter(settings: Record<string, string>) {
+  const rawHost = (settings.smtp_host || '').trim();
+  const rawPort = Number(settings.smtp_port || '587');
+  const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 587;
+  // Auto-align TLS mode with standard ports to prevent handshake timeouts
+  const secure =
+    port === 465
+      ? true
+      : port === 2587 || port === 587 || port === 2525 || port === 25
+      ? false
+      : settings.smtp_secure === 'true';
   const user = (settings.smtp_user || '').trim();
   const pass = settings.smtp_pass || '';
 
-  if (!host) {
+  if (!rawHost) {
     return null;
   }
 
+  const connectHost = await resolveIpv4Host(rawHost);
+
   return nodemailer.createTransport({
-    host,
-    port: Number.isFinite(port) && port > 0 ? port : 587,
+    host: connectHost,
+    port,
     secure,
     auth: user ? { user, pass } : undefined,
+    tls: {
+      servername: rawHost,
+      minVersion: 'TLSv1.2',
+    },
     connectionTimeout: 10000,
     greetingTimeout: 10000,
     socketTimeout: 15000,
   });
+}
+
+function formatSmtpError(err: unknown, host: string, port: number): Error {
+  const msg = err instanceof Error ? err.message : 'Error desconocido al conectar por SMTP.';
+  const isTimeout = /timeout|etimedout|tiempo de espera/i.test(msg);
+  if (isTimeout && (port === 25 || port === 465 || port === 587)) {
+    return new Error(
+      `Connection timeout hacia ${host}:${port}. Render Free y algunos hostings bloquean los puertos SMTP 25, 465 y 587. Cambia el Método de envío a "API HTTPS · Brevo" o "API HTTPS · Resend", o usa un SMTP en puerto 2525.`
+    );
+  }
+  return err instanceof Error ? err : new Error(msg);
+}
+
+function parseFromHeader(fromAddress: string, fallbackName: string): { name: string; email: string } {
+  const trimmed = fromAddress.trim();
+  const match = trimmed.match(/^(.*?)\s*<([^<>@\s]+@[^<>@\s]+)>$/);
+  if (match) {
+    return {
+      name: match[1].replace(/^["']|["']$/g, '').trim() || fallbackName,
+      email: match[2].trim(),
+    };
+  }
+  return { name: fallbackName, email: trimmed };
+}
+
+async function sendViaResend(params: {
+  apiKey: string;
+  from: string;
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HTTP_API_TIMEOUT_MS);
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${params.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: params.from,
+        to: [params.to],
+        subject: params.subject,
+        text: params.text,
+        html: params.html,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = (await res.json()) as { message?: string; error?: string };
+        detail = body.message || body.error || detail;
+      } catch {
+        // ignore json parse failure
+      }
+      throw new Error(`Resend API error: ${detail}`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Tiempo de espera agotado al conectar con Resend API.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sendViaBrevo(params: {
+  apiKey: string;
+  from: string;
+  orgName: string;
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}): Promise<void> {
+  const sender = parseFromHeader(params.from, params.orgName);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HTTP_API_TIMEOUT_MS);
+  try {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': params.apiKey,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        sender,
+        to: [{ email: params.to }],
+        subject: params.subject,
+        textContent: params.text,
+        htmlContent: params.html,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = (await res.json()) as { message?: string; code?: string };
+        detail = body.message || body.code || detail;
+      } catch {
+        // ignore json parse failure
+      }
+      throw new Error(`Brevo API error: ${detail}`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Tiempo de espera agotado al conectar con Brevo API.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -177,7 +331,13 @@ export function evaluateMovementNotification(
 
   const enabled = settings.email_alerts_enabled === 'true';
   const adminEmail = (settings.admin_email || '').trim();
-  if (!enabled || !adminEmail || !settings.smtp_host?.trim()) {
+  const provider = getEmailProvider(settings);
+  const hasTransportCreds =
+    provider === 'smtp'
+      ? Boolean(settings.smtp_host?.trim())
+      : Boolean(settings.email_api_key?.trim());
+
+  if (!enabled || !adminEmail || !hasTransportCreds) {
     return {
       shouldNotify: false,
       skipReason: null,
@@ -241,10 +401,11 @@ export function evaluateMovementNotification(
 
 export function dispatchMovementEmailAsync(payload: MovementEmailPayload): void {
   setImmediate(async () => {
-    let transporter: ReturnType<typeof buildTransporter> = null;
+    let transporter: Awaited<ReturnType<typeof buildTransporter>> = null;
     try {
       const settings = await getResolvedSettingsMap();
       const adminEmail = (settings.admin_email || '').trim();
+      const provider = getEmailProvider(settings);
       const evaluation = evaluateMovementNotification(settings, {
         roleDepartment: payload.roleDepartment,
         movementType: payload.movementType,
@@ -259,11 +420,19 @@ export function dispatchMovementEmailAsync(payload: MovementEmailPayload): void 
         return;
       }
 
-      transporter = buildTransporter(settings);
-      if (!transporter) {
+      if (provider === 'smtp') {
+        transporter = await buildTransporter(settings);
+        if (!transporter) {
+          await execute(
+            'UPDATE attendance_logs SET email_status = $1, email_error = $2 WHERE id = $3',
+            ['failed', 'Servidor SMTP no configurado.', payload.logId]
+          );
+          return;
+        }
+      } else if (!settings.email_api_key?.trim()) {
         await execute(
           'UPDATE attendance_logs SET email_status = $1, email_error = $2 WHERE id = $3',
-          ['failed', 'Servidor SMTP no configurado.', payload.logId]
+          ['failed', `API Key de ${provider} no configurada.`, payload.logId]
         );
         return;
       }
@@ -348,17 +517,50 @@ export function dispatchMovementEmailAsync(payload: MovementEmailPayload): void 
         </div>
       `;
 
-      await withTimeout(
-        transporter.sendMail({
-          from: fromAddress,
+      if (provider === 'brevo') {
+        const brevoFrom =
+          (settings.smtp_from || '').trim() ||
+          (settings.smtp_user || '').trim() ||
+          adminEmail;
+        await sendViaBrevo({
+          apiKey: settings.email_api_key.trim(),
+          from: brevoFrom,
+          orgName,
           to: adminEmail,
           subject,
           text: textBody,
           html: htmlBody,
-        }),
-        SMTP_SEND_TIMEOUT_MS,
-        'Tiempo de espera agotado al conectar con el servidor SMTP.'
-      );
+        });
+      } else if (provider === 'resend') {
+        const resendFrom =
+          (settings.smtp_from || '').trim() || `${orgName} <onboarding@resend.dev>`;
+        await sendViaResend({
+          apiKey: settings.email_api_key.trim(),
+          from: resendFrom,
+          to: adminEmail,
+          subject,
+          text: textBody,
+          html: htmlBody,
+        });
+      } else if (transporter) {
+        const host = (settings.smtp_host || '').trim();
+        const port = Number(settings.smtp_port || '587') || 587;
+        try {
+          await withTimeout(
+            transporter.sendMail({
+              from: fromAddress,
+              to: adminEmail,
+              subject,
+              text: textBody,
+              html: htmlBody,
+            }),
+            SMTP_SEND_TIMEOUT_MS,
+            'Tiempo de espera agotado al conectar con el servidor SMTP.'
+          );
+        } catch (smtpErr) {
+          throw formatSmtpError(smtpErr, host, port);
+        }
+      }
 
       await execute(
         'UPDATE attendance_logs SET email_status = $1, email_error = NULL WHERE id = $2',
@@ -384,20 +586,67 @@ export async function sendTestEmail(overrideSettings?: Record<string, string>): 
   const resolved = await getResolvedSettingsMap();
   const settings = { ...resolved, ...(overrideSettings || {}) };
   const adminEmail = (settings.admin_email || '').trim();
+  const provider = getEmailProvider(settings);
 
   if (!adminEmail) {
     throw new Error('Debe indicar el correo electrónico del administrador.');
   }
+
+  const orgName = settings.organization_name || 'ControlQR';
+  const subject = `[${orgName}] Prueba de notificaciones exitosa`;
+  const text = `Esta es una notificación de prueba enviada desde ${orgName}. Las alertas automáticas de entrada y salida están operativas.`;
+  const html = `<p>Esta es una notificación de prueba enviada desde <strong>${orgName}</strong>.</p><p>Las alertas automáticas de entrada y salida por código QR están operativas.</p>`;
+
+  if (provider === 'brevo') {
+    const apiKey = (settings.email_api_key || '').trim();
+    if (!apiKey) {
+      throw new Error('Debe ingresar la API Key de Brevo.');
+    }
+    const brevoFrom =
+      (settings.smtp_from || '').trim() ||
+      (settings.smtp_user || '').trim() ||
+      adminEmail;
+    await sendViaBrevo({
+      apiKey,
+      from: brevoFrom,
+      orgName,
+      to: adminEmail,
+      subject,
+      text,
+      html,
+    });
+    return;
+  }
+
+  if (provider === 'resend') {
+    const apiKey = (settings.email_api_key || '').trim();
+    if (!apiKey) {
+      throw new Error('Debe ingresar la API Key de Resend.');
+    }
+    const resendFrom =
+      (settings.smtp_from || '').trim() || `${orgName} <onboarding@resend.dev>`;
+    await sendViaResend({
+      apiKey,
+      from: resendFrom,
+      to: adminEmail,
+      subject,
+      text,
+      html,
+    });
+    return;
+  }
+
   if (!settings.smtp_host?.trim()) {
     throw new Error('Debe configurar el servidor SMTP (Host).');
   }
 
-  const transporter = buildTransporter(settings);
+  const transporter = await buildTransporter(settings);
   if (!transporter) {
     throw new Error('Configuración SMTP incompleta.');
   }
 
-  const orgName = settings.organization_name || 'ControlQR';
+  const host = (settings.smtp_host || '').trim();
+  const port = Number(settings.smtp_port || '587') || 587;
   const fromAddress =
     (settings.smtp_from || '').trim() ||
     (settings.smtp_user || '').trim() ||
@@ -413,13 +662,15 @@ export async function sendTestEmail(overrideSettings?: Record<string, string>): 
       transporter.sendMail({
         from: fromAddress,
         to: adminEmail,
-        subject: `[${orgName}] Prueba de notificaciones SMTP exitosa`,
-        text: `Esta es una notificación de prueba enviada desde ${orgName}. Las alertas automáticas de entrada y salida están operativas.`,
-        html: `<p>Esta es una notificación de prueba enviada desde <strong>${orgName}</strong>.</p><p>Las alertas automáticas de entrada y salida por código QR están operativas.</p>`,
+        subject,
+        text,
+        html,
       }),
       SMTP_SEND_TIMEOUT_MS,
       'Tiempo de espera agotado al enviar el correo de prueba.'
     );
+  } catch (err) {
+    throw formatSmtpError(err, host, port);
   } finally {
     transporter.close();
   }

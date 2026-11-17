@@ -9,11 +9,15 @@ import {
   getCachedTerminalMeta,
   getPendingScanCount,
   getPendingScans,
+  hydrateScannerMemoryCache,
   markPendingScansRetryError,
+  predictInstantScanFromMemory,
+  queueOptimisticScanOffline,
   recordOfflineScanInIdb,
   removePendingScans,
   saveScannerBootstrap,
   updateCachedPersonMovement,
+  updateMemoryPersonMovement,
 } from './offlineDb';
 
 export interface OfflineSyncSnapshot {
@@ -178,23 +182,14 @@ export async function syncPendingScans(): Promise<SyncBatchResponse | null> {
   return activeSyncPromise;
 }
 
-export async function submitQrScanWithOfflineFallback(
-  qrToken: string
-): Promise<ScanResponse> {
-  const now = new Date();
-  const localDate = getLocalDateString(now);
-  const localTime = getLocalTimeString(now);
-
-  // If browser already knows it is offline, go straight to IndexedDB without waiting
-  if (typeof navigator !== 'undefined' && !navigator.onLine) {
-    emitState({ isOnline: false });
-    const offlineRes = await recordOfflineScanInIdb(qrToken, localDate, localTime);
-    await refreshOfflineCounters();
-    return offlineRes;
-  }
-
+async function postScanToServer(
+  qrToken: string,
+  localDate: string,
+  localTime: string,
+  timeoutMs = 4500
+): Promise<{ ok: boolean; offlineFallback: boolean; payload?: ScanResponse }> {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 4500);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch('/api/scan', {
@@ -208,34 +203,167 @@ export async function submitQrScanWithOfflineFallback(
       signal: controller.signal,
     }).finally(() => window.clearTimeout(timer));
 
-    // Gateway / proxy / offline errors fallback to local IndexedDB queue
     if (res.status === 502 || res.status === 503 || res.status === 504) {
-      emitState({ isOnline: false });
-      const offlineRes = await recordOfflineScanInIdb(qrToken, localDate, localTime);
-      await refreshOfflineCounters();
-      return offlineRes;
+      return { ok: false, offlineFallback: true };
     }
 
     const payload = (await res.json()) as ScanResponse;
     emitState({ isOnline: true });
-
-    if (payload.status === 'success' && payload.movementType && payload.scannedAt) {
-      await updateCachedPersonMovement(
-        qrToken,
-        payload.movementType,
-        payload.localDate || localDate,
-        payload.scannedAt
-      );
-    }
-
-    return payload;
+    return { ok: true, offlineFallback: false, payload };
   } catch {
-    // Network disconnected or server timed out -> store securely in IndexedDB
+    return { ok: false, offlineFallback: true };
+  }
+}
+
+export async function submitQrScanWithOfflineFallback(
+  qrToken: string
+): Promise<ScanResponse> {
+  const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const now = new Date();
+  const localDate = getLocalDateString(now);
+  const localTime = getLocalTimeString(now);
+
+  // If browser already knows it is offline, go straight to IndexedDB without waiting
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
     emitState({ isOnline: false });
     const offlineRes = await recordOfflineScanInIdb(qrToken, localDate, localTime);
-    await refreshOfflineCounters();
-    return offlineRes;
+    void refreshOfflineCounters();
+    const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;
+    return { ...offlineRes, latencyMs: Math.max(1, Math.round(elapsed)) };
   }
+
+  const result = await postScanToServer(qrToken, localDate, localTime, 4500);
+  if (!result.ok || !result.payload) {
+    emitState({ isOnline: false });
+    const offlineRes = await recordOfflineScanInIdb(qrToken, localDate, localTime);
+    void refreshOfflineCounters();
+    const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;
+    return { ...offlineRes, latencyMs: Math.max(1, Math.round(elapsed)) };
+  }
+
+  const payload = result.payload;
+  if (payload.status === 'success' && payload.movementType && payload.scannedAt) {
+    // Non-blocking cache update so UI updates immediately
+    void updateCachedPersonMovement(
+      qrToken,
+      payload.movementType,
+      payload.localDate || localDate,
+      payload.scannedAt
+    );
+  }
+
+  const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;
+  return { ...payload, latencyMs: Math.max(1, Math.round(elapsed)) };
+}
+
+export async function submitQrScanTurbo(
+  qrToken: string,
+  onReconcile?: (serverResponse: ScanResponse) => void
+): Promise<ScanResponse> {
+  const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const now = new Date();
+  const localDate = getLocalDateString(now);
+  const localTime = getLocalTimeString(now);
+
+  const predicted = predictInstantScanFromMemory(qrToken, localDate, localTime);
+  if (!predicted) {
+    // Unknown token or cache not yet hydrated: use standard server/IDB flow
+    const res = await submitQrScanWithOfflineFallback(qrToken);
+    if (res.status === 'success' && !res.offlineQueued) {
+      // Refresh directory in background so future scans for newly added personnel are instant
+      void refreshOfflineDirectory();
+    }
+    return res;
+  }
+
+  // Cooldown predicted locally -> instant 0-1ms response, skip redundant network call
+  if (predicted.status === 'cooldown') {
+    const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;
+    return { ...predicted, latencyMs: Math.max(1, Math.round(elapsed)) };
+  }
+
+  // Inactive in cache -> instant feedback, verify quietly in background if online
+  if (predicted.status === 'inactive') {
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      void postScanToServer(qrToken, localDate, localTime, 4000).then((res) => {
+        if (res.ok && res.payload && res.payload.status !== 'inactive') {
+          if (res.payload.status === 'success' && res.payload.movementType && res.payload.scannedAt) {
+            void updateCachedPersonMovement(
+              qrToken,
+              res.payload.movementType,
+              res.payload.localDate || localDate,
+              res.payload.scannedAt
+            );
+          }
+          onReconcile?.(res.payload);
+        }
+      });
+    }
+    const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;
+    return { ...predicted, latencyMs: Math.max(1, Math.round(elapsed)) };
+  }
+
+  // Optimistic success! Update in-memory state immediately so rapid repeat scans hit cooldown
+  const predictedMovement = predicted.movementType || 'Entrada';
+  const predictedScannedAt = predicted.scannedAt || now.toISOString();
+  updateMemoryPersonMovement(qrToken, predictedMovement, localDate, predictedScannedAt);
+
+  const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;
+  const instantResponse: ScanResponse = {
+    ...predicted,
+    latencyMs: Math.max(1, Math.round(elapsed)),
+  };
+
+  // Background persistence (server when online, IndexedDB queue when offline/unreachable)
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    emitState({ isOnline: false });
+    void queueOptimisticScanOffline({
+      qrToken,
+      movementType: predictedMovement,
+      scannedAt: predictedScannedAt,
+      localDate,
+      localTime,
+    }).then((offlineRes) => {
+      void refreshOfflineCounters();
+      onReconcile?.(offlineRes);
+    });
+    return instantResponse;
+  }
+
+  void postScanToServer(qrToken, localDate, localTime, 4500).then(async (res) => {
+    if (!res.ok || !res.payload) {
+      emitState({ isOnline: false });
+      const offlineRes = await queueOptimisticScanOffline({
+        qrToken,
+        movementType: predictedMovement,
+        scannedAt: predictedScannedAt,
+        localDate,
+        localTime,
+      });
+      void refreshOfflineCounters();
+      onReconcile?.(offlineRes);
+      return;
+    }
+
+    const serverPayload = res.payload;
+    if (serverPayload.status === 'success' && serverPayload.movementType && serverPayload.scannedAt) {
+      void updateCachedPersonMovement(
+        qrToken,
+        serverPayload.movementType,
+        serverPayload.localDate || localDate,
+        serverPayload.scannedAt
+      );
+      if (serverPayload.movementType !== predictedMovement) {
+        onReconcile?.({ ...serverPayload, optimistic: false });
+      }
+      return;
+    }
+
+    // Server rejected or enforced cooldown/inactive state -> reconcile UI immediately
+    onReconcile?.({ ...serverPayload, optimistic: false });
+  });
+
+  return instantResponse;
 }
 
 function ensureGlobalConnectivityWatchers() {
@@ -281,7 +409,7 @@ export function useOfflineSyncStatus() {
   useEffect(() => {
     ensureGlobalConnectivityWatchers();
     listeners.add(setState);
-    void refreshOfflineCounters();
+    void hydrateScannerMemoryCache().then(() => refreshOfflineCounters());
     if (navigator.onLine) {
       void syncPendingScans();
     }

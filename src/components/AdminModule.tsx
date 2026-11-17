@@ -25,6 +25,7 @@ import {
   X,
 } from 'lucide-react';
 import type {
+  AdminUser,
   AnalyticsResponse,
   AppSettings,
   AttendanceLog,
@@ -33,6 +34,9 @@ import type {
   Personnel,
 } from '../types';
 import {
+  createAdmin,
+  deleteAdmin,
+  fetchAdmins,
   fetchAnalytics,
   fetchAttendanceLogs,
   fetchAttendanceReport,
@@ -42,7 +46,9 @@ import {
   sendTestEmailRequest,
   testSupabaseConnection,
   togglePersonnelStatus,
+  updateAdmin,
   updatePersonnel,
+  updateRecoverySecret,
   updateSettings,
 } from '../utils/api';
 import { getInitials, resizePhotoFile } from '../utils/cardExporter';
@@ -58,7 +64,7 @@ interface AdminModuleProps {
   onAuthExpired: () => void;
 }
 
-type AdminTab = 'overview' | 'personnel' | 'reports' | 'settings';
+type AdminTab = 'overview' | 'personnel' | 'reports' | 'settings' | 'admins';
 type PersonnelFilter = 'all' | 'active' | 'inactive';
 type ReportViewMode = 'consolidated' | 'realtime';
 
@@ -120,6 +126,8 @@ export function AdminModule({
   const [cooldownInput, setCooldownInput] = useState(15);
   const [adminEmailInput, setAdminEmailInput] = useState('');
   const [alertsEnabledInput, setAlertsEnabledInput] = useState(false);
+  const [emailProviderInput, setEmailProviderInput] = useState<'smtp' | 'brevo' | 'resend'>('smtp');
+  const [emailApiKeyInput, setEmailApiKeyInput] = useState('');
   const [smtpHostInput, setSmtpHostInput] = useState('');
   const [smtpPortInput, setSmtpPortInput] = useState(587);
   const [smtpSecureInput, setSmtpSecureInput] = useState(false);
@@ -140,6 +148,22 @@ export function AdminModule({
     null
   );
   const [testingEmail, setTestingEmail] = useState(false);
+  const [adminsList, setAdminsList] = useState<AdminUser[]>([]);
+  const [showAdminModal, setShowAdminModal] = useState(false);
+  const [editingAdmin, setEditingAdmin] = useState<AdminUser | null>(null);
+  const [adminForm, setAdminForm] = useState({
+    username: '',
+    full_name: '',
+    password: '',
+    role: 'admin' as 'superadmin' | 'admin',
+  });
+  const [adminFormError, setAdminFormError] = useState('');
+  const [adminFormSaving, setAdminFormSaving] = useState(false);
+  const [recoverySecretInput, setRecoverySecretInput] = useState('CONTROLQR-RECOVER-2026');
+  const [recoveryStatus, setRecoveryStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(
+    null
+  );
+  const [updatingRecovery, setUpdatingRecovery] = useState(false);
 
   const handleApiError = useCallback(
     (err: unknown) => {
@@ -153,28 +177,109 @@ export function AdminModule({
     [onAuthExpired]
   );
 
+  async function handleSaveAdmin(e: FormEvent) {
+    e.preventDefault();
+    setAdminFormError('');
+    if (!adminForm.full_name.trim()) {
+      setAdminFormError('Ingrese el nombre completo.');
+      return;
+    }
+    if (!editingAdmin && !adminForm.username.trim()) {
+      setAdminFormError('Ingrese el nombre de usuario.');
+      return;
+    }
+    if (!editingAdmin && (!adminForm.password || adminForm.password.length < 4)) {
+      setAdminFormError('La contraseña debe tener al menos 4 caracteres.');
+      return;
+    }
+
+    setAdminFormSaving(true);
+    try {
+      let updated: AdminUser[];
+      if (editingAdmin) {
+        updated = await updateAdmin(editingAdmin.id, {
+          full_name: adminForm.full_name.trim(),
+          role: adminForm.role,
+          password: adminForm.password.trim() || undefined,
+        });
+      } else {
+        updated = await createAdmin({
+          username: adminForm.username.trim().toLowerCase(),
+          password: adminForm.password.trim(),
+          full_name: adminForm.full_name.trim(),
+          role: adminForm.role,
+        });
+      }
+      setAdminsList(updated);
+      setShowAdminModal(false);
+      setEditingAdmin(null);
+      setAdminForm({ username: '', full_name: '', password: '', role: 'admin' });
+    } catch (err) {
+      setAdminFormError(err instanceof Error ? err.message : 'Error al guardar administrador.');
+    } finally {
+      setAdminFormSaving(false);
+    }
+  }
+
+  async function handleDeleteAdmin(id: number, username: string) {
+    if (!window.confirm(`¿Está seguro de eliminar al administrador "${username}"?`)) {
+      return;
+    }
+    try {
+      const updated = await deleteAdmin(id);
+      setAdminsList(updated);
+    } catch (err) {
+      handleApiError(err);
+    }
+  }
+
+  async function handleUpdateRecoverySecret(e: FormEvent) {
+    e.preventDefault();
+    setRecoveryStatus(null);
+    if (!recoverySecretInput.trim() || recoverySecretInput.trim().length < 6) {
+      setRecoveryStatus({ type: 'err', text: 'La clave secreta debe tener al menos 6 caracteres.' });
+      return;
+    }
+    setUpdatingRecovery(true);
+    try {
+      const res = await updateRecoverySecret(recoverySecretInput.trim());
+      setRecoveryStatus({ type: 'ok', text: res.message });
+      setRecoverySecretInput('');
+    } catch (err) {
+      setRecoveryStatus({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Error al actualizar la clave de recuperación.',
+      });
+    } finally {
+      setUpdatingRecovery(false);
+    }
+  }
+
   const loadAllData = useCallback(
     async (dateForReport: string, absentFlag: boolean, silent = false) => {
       if (!silent) setLoading(true);
       try {
-        const [pList, lList, rList, aData, sData] = await Promise.all([
+        const [pList, lList, rList, aData, sData, adminData] = await Promise.all([
           fetchPersonnel(),
           fetchAttendanceLogs(dateForReport),
           fetchAttendanceReport(dateForReport, absentFlag),
           fetchAnalytics(dateForReport),
           fetchSettings(),
+          fetchAdmins().catch(() => []),
         ]);
         setPersonnel(pList);
         setLogs(lList);
         setReportRows(rList);
         setAnalytics(aData);
         setSettings(sData);
+        setAdminsList(adminData);
 
         if (!silent) {
           setOrgInput(sData.organization_name);
           setCooldownInput(sData.cooldown_seconds);
           setAdminEmailInput(sData.admin_email);
           setAlertsEnabledInput(sData.email_alerts_enabled);
+          setEmailProviderInput(sData.email_provider || 'smtp');
           setSmtpHostInput(sData.smtp_host);
           setSmtpPortInput(sData.smtp_port);
           setSmtpSecureInput(sData.smtp_secure);
@@ -334,6 +439,8 @@ export function AdminModule({
         cooldown_seconds: Number(cooldownInput),
         admin_email: adminEmailInput.trim(),
         email_alerts_enabled: alertsEnabledInput,
+        email_provider: emailProviderInput,
+        email_api_key: emailApiKeyInput.trim() || undefined,
         smtp_host: smtpHostInput.trim(),
         smtp_port: Number(smtpPortInput),
         smtp_secure: smtpSecureInput,
@@ -349,6 +456,7 @@ export function AdminModule({
       });
       setSettings(updated);
       setRulesInput(updated.notification_rules || DEFAULT_RULES);
+      setEmailApiKeyInput('');
       setSmtpPassInput('');
       setSupabaseKeyInput('');
       setDatabaseUrlInput('');
@@ -397,6 +505,8 @@ export function AdminModule({
       const res = await sendTestEmailRequest({
         organization_name: orgInput.trim(),
         admin_email: adminEmailInput.trim(),
+        email_provider: emailProviderInput,
+        email_api_key: emailApiKeyInput.trim() || undefined,
         smtp_host: smtpHostInput.trim(),
         smtp_port: Number(smtpPortInput),
         smtp_secure: smtpSecureInput,
@@ -476,6 +586,18 @@ export function AdminModule({
           >
             <Mail className="h-3.5 w-3.5" />
             Notificaciones y Seguridad
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('admins')}
+            className={`inline-flex items-center gap-2 rounded-md px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'admins'
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Administradores
           </button>
         </div>
       </div>
@@ -983,104 +1105,209 @@ export function AdminModule({
               />
             </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-              <div className="sm:col-span-2">
-                <label htmlFor="cfg-smtp-host" className="block text-sm font-medium text-slate-700">
-                  Servidor SMTP (Host)
-                </label>
-                <input
-                  id="cfg-smtp-host"
-                  type="text"
-                  value={smtpHostInput}
-                  onChange={(e) => setSmtpHostInput(e.target.value)}
-                  placeholder="smtp.gmail.com"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
-                />
+            <div>
+              <span className="block text-sm font-medium text-slate-700">Método de envío</span>
+              <div className="mt-1.5 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <button
+                  type="button"
+                  onClick={() => setEmailProviderInput('smtp')}
+                  className={`rounded-lg border px-3 py-2 text-left text-xs font-semibold transition-colors ${
+                    emailProviderInput === 'smtp'
+                      ? 'border-blue-700 bg-blue-50 text-blue-900'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  SMTP Tradicional
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEmailProviderInput('brevo')}
+                  className={`rounded-lg border px-3 py-2 text-left text-xs font-semibold transition-colors ${
+                    emailProviderInput === 'brevo'
+                      ? 'border-blue-700 bg-blue-50 text-blue-900'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  API HTTPS · Brevo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEmailProviderInput('resend')}
+                  className={`rounded-lg border px-3 py-2 text-left text-xs font-semibold transition-colors ${
+                    emailProviderInput === 'resend'
+                      ? 'border-blue-700 bg-blue-50 text-blue-900'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  API HTTPS · Resend
+                </button>
               </div>
-
-              <div>
-                <label htmlFor="cfg-smtp-port" className="block text-sm font-medium text-slate-700">
-                  Puerto
-                </label>
-                <input
-                  id="cfg-smtp-port"
-                  type="number"
-                  value={smtpPortInput}
-                  onChange={(e) => setSmtpPortInput(Number(e.target.value))}
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 tabular-nums focus:border-blue-700 focus:outline-none"
-                />
-              </div>
+              <p className="mt-1.5 text-xs text-slate-500">
+                En Render Free los puertos SMTP 25, 465 y 587 están bloqueados (causan Connection timeout). Usa <strong>API HTTPS (Brevo o Resend)</strong> o SMTP en puerto <strong>2525</strong>.
+              </p>
             </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <label htmlFor="cfg-smtp-user" className="block text-sm font-medium text-slate-700">
-                  Usuario SMTP
-                </label>
-                <input
-                  id="cfg-smtp-user"
-                  type="text"
-                  value={smtpUserInput}
-                  onChange={(e) => setSmtpUserInput(e.target.value)}
-                  placeholder="notificaciones@empresa.com"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
-                />
-              </div>
+            {emailProviderInput === 'smtp' ? (
+              <>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <div className="sm:col-span-2">
+                    <label htmlFor="cfg-smtp-host" className="block text-sm font-medium text-slate-700">
+                      Servidor SMTP (Host)
+                    </label>
+                    <input
+                      id="cfg-smtp-host"
+                      type="text"
+                      value={smtpHostInput}
+                      onChange={(e) => setSmtpHostInput(e.target.value)}
+                      placeholder="smtp-relay.brevo.com o smtp.gmail.com"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
 
-              <div>
-                <label htmlFor="cfg-smtp-pass" className="block text-sm font-medium text-slate-700">
-                  Contraseña / App Password SMTP
-                </label>
-                <input
-                  id="cfg-smtp-pass"
-                  type="password"
-                  value={smtpPassInput}
-                  onChange={(e) => setSmtpPassInput(e.target.value)}
-                  placeholder={
-                    settings?.smtp_pass_configured
-                      ? '•••••••• (guardada, dejar vacío para mantener)'
-                      : 'Ingrese contraseña SMTP'
-                  }
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
-                />
-              </div>
-            </div>
+                  <div>
+                    <label htmlFor="cfg-smtp-port" className="block text-sm font-medium text-slate-700">
+                      Puerto
+                    </label>
+                    <input
+                      id="cfg-smtp-port"
+                      type="number"
+                      value={smtpPortInput}
+                      onChange={(e) => {
+                        const p = Number(e.target.value);
+                        setSmtpPortInput(p);
+                        if (p === 465) setSmtpSecureInput(true);
+                        else if (p === 587 || p === 2525) setSmtpSecureInput(false);
+                      }}
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 tabular-nums focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
+                </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 items-center">
-              <div>
-                <label htmlFor="cfg-smtp-from" className="block text-sm font-medium text-slate-700">
-                  Remitente (From) opcional
-                </label>
-                <input
-                  id="cfg-smtp-from"
-                  type="text"
-                  value={smtpFromInput}
-                  onChange={(e) => setSmtpFromInput(e.target.value)}
-                  placeholder="ControlQR <no-reply@empresa.com>"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
-                />
-              </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label htmlFor="cfg-smtp-user" className="block text-sm font-medium text-slate-700">
+                      Usuario SMTP
+                    </label>
+                    <input
+                      id="cfg-smtp-user"
+                      type="text"
+                      value={smtpUserInput}
+                      onChange={(e) => setSmtpUserInput(e.target.value)}
+                      placeholder="notificaciones@empresa.com"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
 
-              <label className="mt-5 inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-700">
-                <input
-                  type="checkbox"
-                  checked={smtpSecureInput}
-                  onChange={(e) => setSmtpSecureInput(e.target.checked)}
-                  className="h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
-                />
-                Usar SSL/TLS directo (puerto 465)
-              </label>
-            </div>
+                  <div>
+                    <label htmlFor="cfg-smtp-pass" className="block text-sm font-medium text-slate-700">
+                      Contraseña / App Password SMTP
+                    </label>
+                    <input
+                      id="cfg-smtp-pass"
+                      type="password"
+                      value={smtpPassInput}
+                      onChange={(e) => setSmtpPassInput(e.target.value)}
+                      placeholder={
+                        settings?.smtp_pass_configured
+                          ? '•••••••• (guardada, dejar vacío para mantener)'
+                          : 'Ingrese contraseña SMTP'
+                      }
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 items-center">
+                  <div>
+                    <label htmlFor="cfg-smtp-from" className="block text-sm font-medium text-slate-700">
+                      Remitente (From) opcional
+                    </label>
+                    <input
+                      id="cfg-smtp-from"
+                      type="text"
+                      value={smtpFromInput}
+                      onChange={(e) => setSmtpFromInput(e.target.value)}
+                      placeholder="ControlQR <no-reply@empresa.com>"
+                      className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                    />
+                  </div>
+
+                  <label className="mt-5 inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={smtpSecureInput}
+                      onChange={(e) => setSmtpSecureInput(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                    />
+                    Usar SSL/TLS directo (puerto 465)
+                  </label>
+                </div>
+              </>
+            ) : (
+              <div className="space-y-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
+                <div>
+                  <label htmlFor="cfg-email-api-key" className="block text-sm font-medium text-slate-700">
+                    {emailProviderInput === 'brevo' ? 'API Key de Brevo (xkeysib-...)' : 'API Key de Resend (re_...)'}
+                  </label>
+                  <input
+                    id="cfg-email-api-key"
+                    type="password"
+                    value={emailApiKeyInput}
+                    onChange={(e) => setEmailApiKeyInput(e.target.value)}
+                    placeholder={
+                      settings?.email_api_key_configured
+                        ? '•••••••• (guardada, dejar vacío para mantener)'
+                        : emailProviderInput === 'brevo'
+                        ? 'xkeysib-...'
+                        : 're_...'
+                    }
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="cfg-smtp-from" className="block text-sm font-medium text-slate-700">
+                    Remitente (From)
+                  </label>
+                  <input
+                    id="cfg-smtp-from"
+                    type="text"
+                    value={smtpFromInput}
+                    onChange={(e) => setSmtpFromInput(e.target.value)}
+                    placeholder={
+                      emailProviderInput === 'brevo'
+                        ? 'ControlQR <tu-correo-verificado@gmail.com>'
+                        : 'ControlQR <onboarding@resend.dev>'
+                    }
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                  />
+                  <p className="mt-1 text-xs text-slate-500">
+                    {emailProviderInput === 'brevo'
+                      ? 'Envía por puerto HTTPS 443 (sin bloqueo en Render). Verifica tu correo remitente en Brevo (300 correos/día gratis).'
+                      : 'Envía por puerto HTTPS 443 (sin bloqueo en Render). Sin dominio propio usa onboarding@resend.dev hacia tu propio correo.'}
+                  </p>
+                </div>
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
               <button
                 type="button"
                 onClick={handleTestEmail}
-                disabled={testingEmail}
+                disabled={testingEmail || settingsSaving}
                 className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
               >
                 <Send className="h-3.5 w-3.5 text-blue-700" />
                 {testingEmail ? 'Enviando prueba...' : 'Enviar correo de prueba'}
+              </button>
+
+              <button
+                type="submit"
+                disabled={settingsSaving}
+                className="inline-flex min-h-10 items-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-800 disabled:opacity-50"
+              >
+                <Save className="h-3.5 w-3.5" />
+                {settingsSaving ? 'Guardando...' : 'Guardar Alertas y Correo'}
               </button>
             </div>
           </div>
@@ -1941,6 +2168,263 @@ export function AdminModule({
                   className="rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-800 disabled:opacity-50"
                 >
                   {editSaving ? 'Guardando...' : 'Guardar Cambios'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 4: ADMIN USERS MANAGEMENT & RECOVERY SECRET */}
+      {activeTab === 'admins' && (
+        <div className="mt-6 space-y-6">
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white p-6 shadow-xs">
+            <div>
+              <h2 className="font-display text-lg font-bold text-slate-900">
+                Gestión de Administradores y Seguridad
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-600">
+                Administre las cuentas con acceso al panel, roles y la frase secreta de recuperación de contraseña.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setEditingAdmin(null);
+                setAdminForm({ username: '', full_name: '', password: '', role: 'admin' });
+                setAdminFormError('');
+                setShowAdminModal(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-800"
+            >
+              <Plus className="h-4 w-4" />
+              Nuevo Administrador
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            {/* Admins Table */}
+            <div className="rounded-xl border border-slate-200 bg-white p-6 lg:col-span-8">
+              <h3 className="font-display text-base font-bold text-slate-900 mb-4">
+                Cuentas Administradoras Registradas ({adminsList.length})
+              </h3>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm text-slate-700">
+                  <thead className="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-wider text-slate-600">
+                    <tr>
+                      <th className="px-4 py-3">Usuario</th>
+                      <th className="px-4 py-3">Nombre Completo</th>
+                      <th className="px-4 py-3">Rol</th>
+                      <th className="px-4 py-3">Creado</th>
+                      <th className="px-4 py-3 text-right">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200">
+                    {adminsList.map((adm) => (
+                      <tr key={adm.id} className="hover:bg-slate-50">
+                        <td className="px-4 py-3 font-mono font-semibold text-slate-900">
+                          {adm.username}
+                        </td>
+                        <td className="px-4 py-3 font-medium text-slate-900">{adm.full_name}</td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+                              adm.role === 'superadmin'
+                                ? 'bg-purple-100 text-purple-800'
+                                : 'bg-blue-100 text-blue-800'
+                            }`}
+                          >
+                            {adm.role === 'superadmin' ? 'Superadmin' : 'Admin'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-slate-500 font-mono">
+                          {adm.created_at ? adm.created_at.slice(0, 10) : '—'}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingAdmin(adm);
+                                setAdminForm({
+                                  username: adm.username,
+                                  full_name: adm.full_name,
+                                  password: '',
+                                  role: adm.role,
+                                });
+                                setAdminFormError('');
+                                setShowAdminModal(true);
+                              }}
+                              className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                              title="Editar"
+                            >
+                              <Edit3 className="h-4 w-4" />
+                            </button>
+                            {adm.username !== 'admin' && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteAdmin(adm.id, adm.username)}
+                                className="rounded-lg border border-red-200 bg-white p-1.5 text-red-600 hover:bg-red-50"
+                                title="Eliminar"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Recovery Secret Configuration Card */}
+            <div className="rounded-xl border border-slate-200 bg-white p-6 lg:col-span-4">
+              <div className="flex items-center gap-2.5 border-b border-slate-100 pb-4">
+                <KeyRound className="h-5 w-5 text-blue-700" />
+                <h3 className="font-display text-base font-bold text-slate-900">
+                  Clave Secreta de Recuperación
+                </h3>
+              </div>
+
+              <form onSubmit={handleUpdateRecoverySecret} className="mt-4 space-y-4">
+                <div>
+                  <label htmlFor="recovery-secret-input" className="block text-xs font-semibold text-slate-700">
+                    Nueva frase / clave secreta maestra
+                  </label>
+                  <input
+                    id="recovery-secret-input"
+                    type="password"
+                    value={recoverySecretInput}
+                    onChange={(e) => setRecoverySecretInput(e.target.value)}
+                    placeholder="Mínimo 6 caracteres..."
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                  />
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    Esta clave es requerida en la ventana de acceso si un administrador olvida su contraseña.
+                  </p>
+                </div>
+
+                {recoveryStatus && (
+                  <div
+                    className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+                      recoveryStatus.type === 'ok'
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                        : 'border-red-200 bg-red-50 text-red-700'
+                    }`}
+                  >
+                    {recoveryStatus.text}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={updatingRecovery}
+                  className="w-full rounded-lg bg-blue-700 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-blue-800 disabled:opacity-50"
+                >
+                  {updatingRecovery ? 'Actualizando...' : 'Actualizar Clave Secreta'}
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CREATE / EDIT ADMIN MODAL */}
+      {showAdminModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between border-b border-slate-100 pb-3">
+              <h2 className="font-display text-lg font-bold text-slate-900">
+                {editingAdmin ? 'Editar Administrador' : 'Nuevo Administrador'}
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowAdminModal(false)}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveAdmin} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700">Nombre de usuario</label>
+                <input
+                  type="text"
+                  value={adminForm.username}
+                  disabled={Boolean(editingAdmin)}
+                  onChange={(e) => setAdminForm({ ...adminForm, username: e.target.value })}
+                  placeholder="ej. supervisor"
+                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 disabled:bg-slate-100 focus:border-blue-700 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700">Nombre completo</label>
+                <input
+                  type="text"
+                  value={adminForm.full_name}
+                  onChange={(e) => setAdminForm({ ...adminForm, full_name: e.target.value })}
+                  placeholder="ej. Juan Pérez"
+                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700">
+                  {editingAdmin ? 'Nueva contraseña (opcional)' : 'Contraseña / PIN'}
+                </label>
+                <input
+                  type="password"
+                  value={adminForm.password}
+                  onChange={(e) => setAdminForm({ ...adminForm, password: e.target.value })}
+                  placeholder={editingAdmin ? 'Dejar en blanco para mantener actual...' : 'Mínimo 4 caracteres...'}
+                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 font-mono text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700">Rol del administrador</label>
+                <select
+                  value={adminForm.role}
+                  onChange={(e) =>
+                    setAdminForm({ ...adminForm, role: e.target.value as 'superadmin' | 'admin' })
+                  }
+                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-700 focus:outline-none"
+                >
+                  <option value="admin">Administrador (Gestión estándar)</option>
+                  <option value="superadmin">Superadmin (Acceso total)</option>
+                </select>
+              </div>
+
+              {adminFormError && (
+                <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700">
+                  {adminFormError}
+                </p>
+              )}
+
+              <div className="flex items-center justify-end gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAdminModal(false)}
+                  className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={adminFormSaving}
+                  className="rounded-lg bg-blue-700 px-5 py-2 text-xs font-semibold text-white hover:bg-blue-800 disabled:opacity-50"
+                >
+                  {adminFormSaving ? 'Guardando...' : 'Guardar Administrador'}
                 </button>
               </div>
             </form>

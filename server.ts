@@ -302,21 +302,92 @@ async function startServer() {
   });
 
   app.post('/api/auth/verify', (req, res) => {
-    const pin = typeof req.body?.pin === 'string' ? req.body.pin.trim() : '';
-    if (!pin) {
-      res.status(400).json({ error: 'Debe ingresar el PIN o contraseña de administrador.' });
+    const username = typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase() : '';
+    const password =
+      typeof req.body?.password === 'string'
+        ? req.body.password.trim()
+        : typeof req.body?.pin === 'string'
+        ? req.body.pin.trim()
+        : '';
+
+    if (!password) {
+      res.status(400).json({ error: 'Debe ingresar la contraseña o PIN de administrador.' });
       return;
     }
 
-    const storedHash = getSetting('admin_pin_hash');
-    if (hashPin(pin) !== storedHash) {
-      res.status(401).json({ error: 'PIN o contraseña incorrecta.' });
-      return;
+    const hashed = hashPin(password);
+
+    if (username) {
+      const admin = db.prepare('SELECT * FROM admins WHERE username = ?').get(username) as
+        | { password_hash: string }
+        | undefined;
+      if (!admin || admin.password_hash !== hashed) {
+        res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+        return;
+      }
+    } else {
+      const admins = db.prepare('SELECT password_hash FROM admins').all() as Array<{
+        password_hash: string;
+      }>;
+      const matched =
+        admins.some((a) => a.password_hash === hashed) ||
+        hashed === getSetting('admin_pin_hash');
+      if (!matched) {
+        res.status(401).json({ error: 'Contraseña o PIN incorrecto.' });
+        return;
+      }
     }
 
     const token = crypto.randomBytes(32).toString('hex');
     activeSessions.set(token, Date.now() + SESSION_TTL_MS);
     res.json({ token, expiresInMs: SESSION_TTL_MS });
+  });
+
+  app.post('/api/auth/recover', (req, res) => {
+    const username =
+      typeof req.body?.username === 'string' && req.body.username.trim()
+        ? req.body.username.trim().toLowerCase()
+        : 'admin';
+    const recoverySecret =
+      typeof req.body?.recovery_secret === 'string' ? req.body.recovery_secret.trim() : '';
+    const newPassword =
+      typeof req.body?.new_password === 'string' ? req.body.new_password.trim() : '';
+
+    if (!recoverySecret || !newPassword) {
+      res.status(400).json({
+        error: 'Debe ingresar la clave secreta de recuperación y la nueva contraseña.',
+      });
+      return;
+    }
+
+    if (newPassword.length < 4) {
+      res.status(400).json({ error: 'La nueva contraseña debe tener al menos 4 caracteres.' });
+      return;
+    }
+
+    const storedSecretHash =
+      getSetting('recovery_secret_hash') || hashPin('CONTROLQR-RECOVER-2026');
+    if (hashPin(recoverySecret) !== storedSecretHash) {
+      res.status(401).json({ error: 'La clave secreta de recuperación es incorrecta.' });
+      return;
+    }
+
+    const admin = db.prepare('SELECT id FROM admins WHERE username = ?').get(username) as
+      | { id: number }
+      | undefined;
+    if (!admin) {
+      res.status(404).json({ error: `El usuario administrador "${username}" no existe.` });
+      return;
+    }
+
+    const newHash = hashPin(newPassword);
+    db.prepare('UPDATE admins SET password_hash = ? WHERE id = ?').run(newHash, admin.id);
+
+    if (username === 'admin') {
+      setSetting('admin_pin_hash', newHash);
+    }
+
+    res.json({ ok: true, message: 'Contraseña restablecida exitosamente.' });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -325,6 +396,141 @@ async function startServer() {
       activeSessions.delete(token);
     }
     res.json({ ok: true });
+  });
+
+  // Admin Users Management API
+  app.get('/api/admins', requireAdmin, (_req, res) => {
+    const admins = db
+      .prepare('SELECT id, username, full_name, role, created_at FROM admins ORDER BY id ASC')
+      .all();
+    res.json(admins);
+  });
+
+  app.post('/api/admins', requireAdmin, (req, res) => {
+    const username =
+      typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+    const fullName = typeof req.body?.full_name === 'string' ? req.body.full_name.trim() : '';
+    const role = req.body?.role === 'superadmin' ? 'superadmin' : 'admin';
+
+    if (!username || !password || !fullName) {
+      res.status(400).json({ error: 'Complete usuario, contraseña y nombre completo.' });
+      return;
+    }
+
+    if (password.length < 4) {
+      res.status(400).json({ error: 'La contraseña debe tener al menos 4 caracteres.' });
+      return;
+    }
+
+    const existing = db.prepare('SELECT id FROM admins WHERE username = ?').get(username);
+    if (existing) {
+      res.status(400).json({ error: 'El nombre de usuario ya está registrado.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const hash = hashPin(password);
+    db.prepare(
+      'INSERT INTO admins (username, password_hash, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(username, hash, fullName, role, now);
+
+    const admins = db
+      .prepare('SELECT id, username, full_name, role, created_at FROM admins ORDER BY id ASC')
+      .all();
+    res.json(admins);
+  });
+
+  app.put('/api/admins/:id', requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    const fullName = typeof req.body?.full_name === 'string' ? req.body.full_name.trim() : '';
+    const role = req.body?.role === 'superadmin' ? 'superadmin' : 'admin';
+    const password =
+      typeof req.body?.password === 'string' && req.body.password.trim().length > 0
+        ? req.body.password.trim()
+        : '';
+
+    const admin = db.prepare('SELECT * FROM admins WHERE id = ?').get(id) as
+      | { id: number; username: string }
+      | undefined;
+    if (!admin) {
+      res.status(404).json({ error: 'Administrador no encontrado.' });
+      return;
+    }
+
+    if (password) {
+      if (password.length < 4) {
+        res.status(400).json({ error: 'La contraseña debe tener al menos 4 caracteres.' });
+        return;
+      }
+      const hash = hashPin(password);
+      db.prepare(
+        'UPDATE admins SET password_hash = ?, full_name = ?, role = ? WHERE id = ?'
+      ).run(hash, fullName || admin.username, role, id);
+      if (admin.username === 'admin') {
+        setSetting('admin_pin_hash', hash);
+      }
+    } else {
+      db.prepare('UPDATE admins SET full_name = ?, role = ? WHERE id = ?').run(
+        fullName || admin.username,
+        role,
+        id
+      );
+    }
+
+    const admins = db
+      .prepare('SELECT id, username, full_name, role, created_at FROM admins ORDER BY id ASC')
+      .all();
+    res.json(admins);
+  });
+
+  app.delete('/api/admins/:id', requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    const admin = db.prepare('SELECT * FROM admins WHERE id = ?').get(id) as
+      | { id: number; username: string; role: string }
+      | undefined;
+    if (!admin) {
+      res.status(404).json({ error: 'Administrador no encontrado.' });
+      return;
+    }
+
+    if (admin.username === 'admin') {
+      res.status(400).json({
+        error: 'No se puede eliminar el usuario administrador principal ("admin").',
+      });
+      return;
+    }
+
+    const superCount = (
+      db.prepare("SELECT COUNT(*) as cnt FROM admins WHERE role = 'superadmin'").get() as {
+        cnt: number;
+      }
+    ).cnt;
+    if (admin.role === 'superadmin' && superCount <= 1) {
+      res.status(400).json({
+        error: 'Debe existir al menos un administrador con rol Superadmin.',
+      });
+      return;
+    }
+
+    db.prepare('DELETE FROM admins WHERE id = ?').run(id);
+    const admins = db
+      .prepare('SELECT id, username, full_name, role, created_at FROM admins ORDER BY id ASC')
+      .all();
+    res.json(admins);
+  });
+
+  app.put('/api/settings/recovery-secret', requireAdmin, (req, res) => {
+    const secret =
+      typeof req.body?.recovery_secret === 'string' ? req.body.recovery_secret.trim() : '';
+    if (!secret || secret.length < 6) {
+      res.status(400).json({
+        error: 'La clave secreta de recuperación debe tener al menos 6 caracteres.',
+      });
+      return;
+    }
+    setSetting('recovery_secret_hash', hashPin(secret));
+    res.json({ ok: true, message: 'Clave secreta de recuperación actualizada correctamente.' });
   });
 
   // Public Scanner Terminal Config (non-sensitive)
@@ -1281,6 +1487,9 @@ async function startServer() {
       cooldown_seconds: Number(s.cooldown_seconds || '15'),
       admin_email: s.admin_email || '',
       email_alerts_enabled: s.email_alerts_enabled === 'true',
+      email_provider:
+        s.email_provider === 'brevo' || s.email_provider === 'resend' ? s.email_provider : 'smtp',
+      email_api_key_configured: Boolean(s.email_api_key),
       smtp_host: s.smtp_host || '',
       smtp_port: Number(s.smtp_port || '587'),
       smtp_secure: s.smtp_secure === 'true',
@@ -1314,6 +1523,18 @@ async function startServer() {
 
     if (typeof body.email_alerts_enabled === 'boolean') {
       setSetting('email_alerts_enabled', String(body.email_alerts_enabled));
+    }
+
+    if (
+      body.email_provider === 'smtp' ||
+      body.email_provider === 'brevo' ||
+      body.email_provider === 'resend'
+    ) {
+      setSetting('email_provider', body.email_provider);
+    }
+
+    if (typeof body.email_api_key === 'string' && body.email_api_key.trim().length > 0) {
+      setSetting('email_api_key', encryptSecret(body.email_api_key.trim()));
     }
 
     if (typeof body.smtp_host === 'string') {
@@ -1368,7 +1589,9 @@ async function startServer() {
         res.status(400).json({ error: 'El nuevo PIN debe tener al menos 4 caracteres.' });
         return;
       }
-      setSetting('admin_pin_hash', hashPin(newPin));
+      const newHash = hashPin(newPin);
+      setSetting('admin_pin_hash', newHash);
+      db.prepare("UPDATE admins SET password_hash = ? WHERE username = 'admin'").run(newHash);
     }
 
     const s = getResolvedSettingsMap();
@@ -1377,6 +1600,9 @@ async function startServer() {
       cooldown_seconds: Number(s.cooldown_seconds || '15'),
       admin_email: s.admin_email || '',
       email_alerts_enabled: s.email_alerts_enabled === 'true',
+      email_provider:
+        s.email_provider === 'brevo' || s.email_provider === 'resend' ? s.email_provider : 'smtp',
+      email_api_key_configured: Boolean(s.email_api_key),
       smtp_host: s.smtp_host || '',
       smtp_port: Number(s.smtp_port || '587'),
       smtp_secure: s.smtp_secure === 'true',
@@ -1469,6 +1695,16 @@ async function startServer() {
     try {
       const overrides: Record<string, string> = {};
       if (typeof req.body?.admin_email === 'string') overrides.admin_email = req.body.admin_email;
+      if (
+        req.body?.email_provider === 'smtp' ||
+        req.body?.email_provider === 'brevo' ||
+        req.body?.email_provider === 'resend'
+      ) {
+        overrides.email_provider = req.body.email_provider;
+      }
+      if (typeof req.body?.email_api_key === 'string' && req.body.email_api_key.trim().length > 0) {
+        overrides.email_api_key = req.body.email_api_key.trim();
+      }
       if (typeof req.body?.smtp_host === 'string') overrides.smtp_host = req.body.smtp_host;
       if (req.body?.smtp_port !== undefined) overrides.smtp_port = String(req.body.smtp_port);
       if (typeof req.body?.smtp_secure === 'boolean') overrides.smtp_secure = String(req.body.smtp_secure);

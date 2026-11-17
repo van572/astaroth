@@ -1,4 +1,5 @@
 import type {
+  AdminUser,
   AnalyticsResponse,
   AppSettings,
   AttendanceLog,
@@ -106,6 +107,71 @@ export async function verifyAdminPin(pin: string): Promise<string> {
   });
   setStoredAdminToken(res.token);
   return res.token;
+}
+
+export async function verifyAdminCredentials(payload: {
+  username?: string;
+  password?: string;
+  pin?: string;
+}): Promise<string> {
+  const res = await apiFetch<{ token: string }>('/api/auth/verify', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  setStoredAdminToken(res.token);
+  return res.token;
+}
+
+export async function recoverAdminPassword(payload: {
+  username: string;
+  recovery_secret: string;
+  new_password: string;
+}): Promise<{ ok: boolean; message: string }> {
+  return apiFetch<{ ok: boolean; message: string }>('/api/auth/recover', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchAdmins(): Promise<AdminUser[]> {
+  return apiFetch<AdminUser[]>('/api/admins', {}, true);
+}
+
+export async function createAdmin(payload: {
+  username: string;
+  password: string;
+  full_name: string;
+  role: 'superadmin' | 'admin';
+}): Promise<AdminUser[]> {
+  return apiFetch<AdminUser[]>('/api/admins', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }, true);
+}
+
+export async function updateAdmin(
+  id: number,
+  payload: { full_name?: string; role?: 'superadmin' | 'admin'; password?: string }
+): Promise<AdminUser[]> {
+  return apiFetch<AdminUser[]>(`/api/admins/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }, true);
+}
+
+export async function deleteAdmin(id: number): Promise<AdminUser[]> {
+  return apiFetch<AdminUser[]>(`/api/admins/${id}`, {
+    method: 'DELETE',
+  }, true);
+}
+
+export async function updateRecoverySecret(
+  recovery_secret: string
+): Promise<{ ok: boolean; message: string }> {
+  return apiFetch<{ ok: boolean; message: string }>('/api/settings/recovery-secret', {
+    method: 'PUT',
+    body: JSON.stringify({ recovery_secret }),
+  }, true);
 }
 
 export async function logoutAdmin(): Promise<void> {
@@ -245,6 +311,8 @@ export async function updateSettings(payload: Partial<{
   cooldown_seconds: number;
   admin_email: string;
   email_alerts_enabled: boolean;
+  email_provider: 'smtp' | 'brevo' | 'resend';
+  email_api_key: string;
   smtp_host: string;
   smtp_port: number;
   smtp_secure: boolean;

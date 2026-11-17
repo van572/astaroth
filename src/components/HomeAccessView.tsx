@@ -14,7 +14,7 @@ import { PWAInstallButton } from './PWAInstallButton';
 interface HomeAccessViewProps {
   organizationName: string;
   isAdminAuthenticated: boolean;
-  onSelectModule: (target: Exclude<ModuleView, 'home'>) => void;
+  onSelectModule: (target: ModuleView) => void;
   onLockSession: () => void;
 }
 
@@ -65,21 +65,14 @@ export function HomeAccessView({
           <div className="flex items-center gap-3.5 shrink-0">
             <DatabaseStatusDot />
             <PWAInstallButton />
-            {isAdminAuthenticated ? (
-              <button
-                type="button"
-                onClick={onLockSession}
-                className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
-              >
-                <Lock className="h-3.5 w-3.5 text-slate-600" />
-                Bloquear acceso admin
-              </button>
-            ) : (
-              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 whitespace-nowrap shrink-0">
-                <Lock className="h-3.5 w-3.5" />
-                Punto de Acceso
-              </span>
-            )}
+            <button
+              type="button"
+              onClick={onLockSession}
+              className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
+            >
+              <Lock className="h-3.5 w-3.5 text-slate-600" />
+              Cerrar sesión
+            </button>
           </div>
         </div>
       </header>
@@ -91,7 +84,7 @@ export function HomeAccessView({
             Control de Entradas y Salidas por Código QR
           </h1>
           <p className="mt-3 text-base leading-relaxed text-slate-600">
-            Seleccione el módulo de operación. El terminal de escaneo funciona de manera directa; el registro de personal y la administración requieren clave de autorización.
+            Seleccione el módulo de operación. Al abrir el Modo Escáner, el terminal quedará bloqueado y requerirá contraseña de administrador para poder salir.
           </p>
         </div>
 
@@ -107,8 +100,9 @@ export function HomeAccessView({
                 <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-blue-700 text-white">
                   <QrCode className="h-6 w-6" />
                 </div>
-                <span className="text-xs font-medium text-emerald-700">
-                  Acceso directo
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700">
+                  <Lock className="h-3.5 w-3.5" />
+                  Bloqueo al salir
                 </span>
               </div>
 
@@ -116,7 +110,7 @@ export function HomeAccessView({
                 Modo Escáner
               </h2>
               <p className="mt-2 text-sm leading-relaxed text-slate-600">
-                Terminal de lectura continua en tiempo real. Detecta automáticamente Entrada o Salida con protección anti-rebote y alerta sonora.
+                Terminal de lectura continua en tiempo real. Detecta automáticamente Entrada o Salida con protección anti-rebote y bloqueo de salida.
               </p>
             </div>
 

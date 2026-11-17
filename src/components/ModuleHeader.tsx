@@ -1,11 +1,11 @@
-import { ArrowLeft, Lock, LockOpen } from 'lucide-react';
+import { ArrowLeft, Lock, LogOut } from 'lucide-react';
 import type { ModuleView } from '../types';
 import { DatabaseStatusDot } from './DatabaseStatusDot';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ModuleHeaderProps {
   organizationName: string;
-  activeView: Exclude<ModuleView, 'home'>;
+  activeView: Exclude<ModuleView, 'home' | 'login'>;
   isAdminAuthenticated: boolean;
   onNavigate: (view: ModuleView) => void;
   onLockSession: () => void;
@@ -18,6 +18,8 @@ export function ModuleHeader({
   onNavigate,
   onLockSession,
 }: ModuleHeaderProps) {
+  const isScannerLocked = activeView === 'scanner';
+
   return (
     <header className="border-b border-slate-200 bg-white">
       <div className="mx-auto flex max-w-7xl items-center justify-between gap-8 px-6 py-3.5">
@@ -28,7 +30,11 @@ export function ModuleHeader({
             onClick={() => onNavigate('home')}
             className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-100 hover:text-slate-900 whitespace-nowrap shrink-0"
           >
-            <ArrowLeft className="h-3.5 w-3.5" />
+            {isScannerLocked ? (
+              <Lock className="h-3.5 w-3.5 text-amber-600" />
+            ) : (
+              <ArrowLeft className="h-3.5 w-3.5" />
+            )}
             Inicio
           </button>
           <span className="font-display text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
@@ -62,7 +68,9 @@ export function ModuleHeader({
                 : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
           >
-            {!isAdminAuthenticated && <Lock className="h-3 w-3 text-slate-400" />}
+            {(isScannerLocked || !isAdminAuthenticated) && (
+              <Lock className="h-3 w-3 text-slate-400" />
+            )}
             Registro de Personal
           </button>
           <button
@@ -74,7 +82,9 @@ export function ModuleHeader({
                 : 'border-transparent text-slate-600 hover:text-slate-900'
             }`}
           >
-            {!isAdminAuthenticated && <Lock className="h-3 w-3 text-slate-400" />}
+            {(isScannerLocked || !isAdminAuthenticated) && (
+              <Lock className="h-3 w-3 text-slate-400" />
+            )}
             Panel de Administración
           </button>
         </nav>
@@ -82,23 +92,23 @@ export function ModuleHeader({
         {/* Zone 3: Install & primary session action */}
         <div className="flex items-center gap-2.5 shrink-0">
           <PWAInstallButton />
-          {isAdminAuthenticated ? (
+          {isScannerLocked ? (
+            <button
+              type="button"
+              onClick={() => onNavigate('home')}
+              className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3.5 py-2 text-xs font-semibold text-amber-900 transition-colors hover:bg-amber-100 whitespace-nowrap shrink-0"
+            >
+              <Lock className="h-3.5 w-3.5 text-amber-700" />
+              Desbloquear salida
+            </button>
+          ) : (
             <button
               type="button"
               onClick={onLockSession}
               className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
             >
-              <LockOpen className="h-3.5 w-3.5 text-emerald-700" />
-              Bloquear sesión
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => onNavigate('admin')}
-              className="inline-flex min-h-10 items-center gap-2 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 whitespace-nowrap shrink-0"
-            >
-              <Lock className="h-3.5 w-3.5" />
-              Acceso admin
+              <LogOut className="h-3.5 w-3.5 text-slate-600" />
+              Cerrar sesión
             </button>
           )}
         </div>

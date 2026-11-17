@@ -112,8 +112,27 @@ export function initDatabase(): void {
 
     CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_logs(local_date);
     CREATE INDEX IF NOT EXISTS idx_attendance_personnel_date ON attendance_logs(personnel_id, local_date);
+    CREATE INDEX IF NOT EXISTS idx_attendance_personnel_id_desc ON attendance_logs(personnel_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_attendance_personnel_date_id ON attendance_logs(personnel_id, local_date, id DESC);
     CREATE INDEX IF NOT EXISTS idx_personnel_qr ON personnel(qr_token);
+
+    CREATE TABLE IF NOT EXISTS admins (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      full_name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'admin',
+      created_at TEXT NOT NULL
+    );
   `);
+
+  const adminCountRow = db.prepare('SELECT COUNT(*) as cnt FROM admins').get() as { cnt: number };
+  if (adminCountRow.cnt === 0) {
+    const now = new Date().toISOString();
+    db.prepare(
+      'INSERT INTO admins (username, password_hash, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('admin', DEFAULT_PIN_HASH, 'Administrador Principal', 'superadmin', now);
+  }
 
   const logColumns = db.prepare('PRAGMA table_info(attendance_logs)').all() as Array<{ name: string }>;
   if (!logColumns.some((col) => col.name === 'client_scan_id')) {
@@ -124,19 +143,41 @@ export function initDatabase(): void {
   );
 
   const envPass = process.env.SMTP_PASS || '';
-  const hasEnvSmtp = Boolean(process.env.SMTP_HOST?.trim() && process.env.ADMIN_EMAIL?.trim());
+  const envEmailProviderRaw = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
+  const envEmailApiKey =
+    (envEmailProviderRaw === 'resend'
+      ? process.env.RESEND_API_KEY
+      : envEmailProviderRaw === 'brevo'
+      ? process.env.BREVO_API_KEY
+      : process.env.BREVO_API_KEY || process.env.RESEND_API_KEY
+    )?.trim() || '';
+  const detectedEnvProvider =
+    envEmailProviderRaw === 'brevo' || envEmailProviderRaw === 'resend' || envEmailProviderRaw === 'smtp'
+      ? envEmailProviderRaw
+      : process.env.BREVO_API_KEY?.trim()
+      ? 'brevo'
+      : process.env.RESEND_API_KEY?.trim()
+      ? 'resend'
+      : 'smtp';
+  const hasEnvSmtp = Boolean(
+    process.env.ADMIN_EMAIL?.trim() &&
+      (process.env.SMTP_HOST?.trim() || (detectedEnvProvider !== 'smtp' && envEmailApiKey))
+  );
   const envSupabaseKey = process.env.SUPABASE_KEY?.trim() || '';
   const envDatabaseUrl = process.env.DATABASE_URL?.trim() || (dataDirIsPostgresUrl ? rawDataDir : '');
   const hasEnvSupabase = Boolean(process.env.SUPABASE_URL?.trim() || envDatabaseUrl);
 
   const defaultSettings: Record<string, string> = {
     admin_pin_hash: DEFAULT_PIN_HASH,
+    recovery_secret_hash: hashPin('CONTROLQR-RECOVER-2026'),
     organization_name: 'ControlQR Corporativo',
     cooldown_seconds: '15',
     admin_email: process.env.ADMIN_EMAIL?.trim() || '',
     email_alerts_enabled: hasEnvSmtp ? 'true' : 'false',
+    email_provider: detectedEnvProvider,
+    email_api_key: envEmailApiKey ? encryptSecret(envEmailApiKey) : '',
     smtp_host: process.env.SMTP_HOST?.trim() || '',
-    smtp_port: process.env.SMTP_PORT?.trim() || '587',
+    smtp_port: process.env.SMTP_PORT?.trim() || '2587',
     smtp_secure: process.env.SMTP_SECURE === 'true' ? 'true' : 'false',
     smtp_user: process.env.SMTP_USER?.trim() || '',
     smtp_pass: envPass ? encryptSecret(envPass) : '',
@@ -170,9 +211,28 @@ export function initDatabase(): void {
     }
   });
   tx();
+
+  // Align legacy placeholder hash with displayed default CONTROLQR-RECOVER-2026
+  const oldPlaceholderHash = hashPin('CONTROLQR-SECRET-2026');
+  db.prepare("UPDATE settings SET value = ? WHERE key = 'recovery_secret_hash' AND value = ?").run(
+    hashPin('CONTROLQR-RECOVER-2026'),
+    oldPlaceholderHash
+  );
+  invalidateSettingsCache();
+}
+
+let cachedSettingsMap: Record<string, string> | null = null;
+let cachedResolvedSettingsMap: Record<string, string> | null = null;
+
+export function invalidateSettingsCache(): void {
+  cachedSettingsMap = null;
+  cachedResolvedSettingsMap = null;
 }
 
 export function getSetting(key: string): string {
+  if (cachedSettingsMap && key in cachedSettingsMap) {
+    return cachedSettingsMap[key] ?? '';
+  }
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
     | { value: string }
     | undefined;
@@ -183,9 +243,13 @@ export function setSetting(key: string, value: string): void {
   db.prepare(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
   ).run(key, value);
+  invalidateSettingsCache();
 }
 
 export function getAllSettingsMap(): Record<string, string> {
+  if (cachedSettingsMap) {
+    return { ...cachedSettingsMap };
+  }
   const rows = db.prepare('SELECT key, value FROM settings').all() as Array<{
     key: string;
     value: string;
@@ -194,17 +258,43 @@ export function getAllSettingsMap(): Record<string, string> {
   for (const row of rows) {
     map[row.key] = row.value;
   }
-  return map;
+  cachedSettingsMap = map;
+  return { ...map };
 }
 
 export function getResolvedSettingsMap(): Record<string, string> {
+  if (cachedResolvedSettingsMap) {
+    return { ...cachedResolvedSettingsMap };
+  }
   const map = getAllSettingsMap();
   const decryptedDbPass = decryptSecret(map.smtp_pass || '');
+  const decryptedEmailApiKey = decryptSecret(map.email_api_key || '');
   const decryptedSupabaseKey = decryptSecret(map.supabase_key || '');
   const decryptedDatabaseUrl = decryptSecret(map.database_url || '');
-  return {
+  const envProviderRaw = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
+  const resolvedProvider =
+    map.email_provider === 'brevo' || map.email_provider === 'resend' || map.email_provider === 'smtp'
+      ? map.email_provider
+      : envProviderRaw === 'brevo' || envProviderRaw === 'resend' || envProviderRaw === 'smtp'
+      ? envProviderRaw
+      : process.env.BREVO_API_KEY?.trim()
+      ? 'brevo'
+      : process.env.RESEND_API_KEY?.trim()
+      ? 'resend'
+      : 'smtp';
+  const envApiKey =
+    (resolvedProvider === 'resend'
+      ? process.env.RESEND_API_KEY
+      : resolvedProvider === 'brevo'
+      ? process.env.BREVO_API_KEY
+      : process.env.BREVO_API_KEY || process.env.RESEND_API_KEY
+    )?.trim() || '';
+
+  const resolved: Record<string, string> = {
     ...map,
     admin_email: map.admin_email || process.env.ADMIN_EMAIL?.trim() || '',
+    email_provider: resolvedProvider,
+    email_api_key: decryptedEmailApiKey || envApiKey,
     smtp_host: map.smtp_host || process.env.SMTP_HOST?.trim() || '',
     smtp_port: map.smtp_port || process.env.SMTP_PORT?.trim() || '587',
     smtp_secure: map.smtp_secure || (process.env.SMTP_SECURE === 'true' ? 'true' : 'false'),
@@ -216,4 +306,6 @@ export function getResolvedSettingsMap(): Record<string, string> {
     supabase_key: decryptedSupabaseKey || process.env.SUPABASE_KEY?.trim() || '',
     database_url: decryptedDatabaseUrl || process.env.DATABASE_URL?.trim() || (dataDirIsPostgresUrl ? rawDataDir : ''),
   };
+  cachedResolvedSettingsMap = resolved;
+  return { ...resolved };
 }
